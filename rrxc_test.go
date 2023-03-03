@@ -107,7 +107,7 @@ func TestController_Synchronize(t *testing.T) {
 }
 
 func TestController_Wait(t *testing.T) {
-	intermediateCTX, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	intermediateCTX, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 	ctx := rrxc.NewControllerContext(intermediateCTX)
 
@@ -125,7 +125,7 @@ func TestController_Wait(t *testing.T) {
 			t.Log(err)
 			return
 		}
-		for i := 0; i < 100; i++ {
+		for i := 0; i < 99; i++ {
 			id := fmt.Sprintf("abc%d", i)
 			if err := controller.RegisterResponse(id, "Hello there, "+id); err != nil {
 				t.Log(err)
@@ -153,6 +153,16 @@ func TestController_Wait(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	if xcresult.AllRequestsRespondedTo {
+		t.Fatal("expected that not all requests were responded to, but results says they were")
+	}
+
+	taggedForRollback := "abc99"
+	if !c.HasTag(taggedForRollback, "rollback") {
+		t.Fatalf("%s not tagged for rollback", taggedForRollback)
+	}
+
 	xc.Close()
 
 	j, err := json.MarshalIndent(xcresult, "", "  ")
