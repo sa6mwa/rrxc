@@ -4,6 +4,7 @@ package rrxc_test
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"testing"
 	"time"
@@ -61,20 +62,44 @@ func TestExchangeFromContext(t *testing.T) {
 
 func TestControllerSync(t *testing.T) {
 	c := rrxc.NewController()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	intermediateCTX, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+	ctx := c.NewControllerContext(intermediateCTX)
+
+	ready := make(chan struct{})
+
+	go func() {
+		<-ready
+		controller, err := rrxc.ControllerFromContext(ctx)
+		if err != nil {
+			t.Log(err)
+			return
+		}
+
+		for i := 0; i < 100; i++ {
+			id := fmt.Sprintf("abc%d", i)
+			if err := controller.RegisterResponse(id, "no comment "+id); err != nil {
+				t.Log(err)
+			}
+		}
+
+	}()
 
 	xcresult, err := c.Synchronize(c.NewExchangeContext(ctx), func(sb rrxc.SyncBundle) error {
 		for i := 0; i < 100; i++ {
-			id := sb.Exchange.NewCorrelID()
+
+			id := fmt.Sprintf("abc%d", i)
+
+			//id := sb.Exchange.NewCorrelID()
 			if err := sb.Exchange.RegisterRequest(id, "hello world"); err != nil {
 				t.Fatal(err)
 			}
 
-			if err := sb.Exchange.RegisterResponse(id, "hello there", true); err != nil {
-				t.Fatal(err)
-			}
+			// if err := sb.Exchange.RegisterResponse(id, "hello there", true); err != nil {
+			// 	t.Fatal(err)
+			// }
 		}
+		close(ready)
 		return nil
 	})
 	if err != nil {

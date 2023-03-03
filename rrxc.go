@@ -22,7 +22,11 @@ import (
 
 // A controller handles multiple exchanges.
 type Controller interface {
+	NewControllerContext(ctx context.Context) context.Context
 	NewExchangeContext(ctx context.Context) context.Context
+	RegisterResponse(correlID string, response any, dropDuplicates ...bool) error
+	RegisterRequestByContext(ctx context.Context, correlID string, request any, notificationChannelsOnResponse ...chan RequestResponse) error
+	RegisterResponseByContext(ctx context.Context, correlID string, response any, dropDuplicates ...bool) error
 	Synchronize(ctx context.Context, operation func(sb SyncBundle) error) (ExchangeResult, error)
 	Tag(entity any, tag any, notificationChannels ...chan any)
 	Untag(entity any, tag any, notificationChannels ...chan any) error
@@ -36,6 +40,7 @@ type Exchange interface {
 	NewCorrelID() (correlID string)
 	RegisterRequest(correlID string, request any, notificationChannelsOnResponse ...chan RequestResponse) error
 	RegisterResponse(correlID string, response any, dropDuplicates ...bool) error
+	HasRequest(correlID string) bool
 	GetExchangeResult() ExchangeResult
 	GetRequestsAndResponses() []RequestResponse
 	GetRequest(correlID string) (any, error)
@@ -81,7 +86,11 @@ type RequestResponse struct {
 	Latency            time.Duration
 }
 
-// Key used to store and load the exchange strcut from the AnyStore in the
+// Key used to store and load the controller interface from the AnyStore in the
+// context value (of a context.Context).
+type controllerKey struct{}
+
+// Key used to store and load the exchange interface from the AnyStore in the
 // atomix struct.
 type exchangeKey struct{}
 
@@ -141,6 +150,7 @@ type tagMap map[any]struct{}
 var NewID func() string = NewID256
 
 var (
+	ErrNoControllerContext  error = errors.New("context has no request/response controller")
 	ErrNoExchangeInContext  error = errors.New("context has no request/response exchange")
 	ErrUnableToLoadExchange error = errors.New("unable to load exchange, key not found")
 	ErrCorrelIDConflict     error = errors.New("correlation identifier conflict: already have a request with that correlID")
@@ -161,6 +171,31 @@ func NewController() Controller {
 		mapOfMaps: anystore.NewAnyStore(),
 		done:      make(chan struct{}),
 	}
+}
+
+// Controller.NewControllerContext stores the already initiated controller in
+// ctx Values to be retrieved using rrxc.ControllerFromContext. Returns a
+// derived context.
+func (c *controller) NewControllerContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, controllerKey{}, c)
+}
+
+// NewControllerContext calls NewController and stores it in the context.Values
+// which is simple to load using rrxc.ControllerFromContext. Returns a derived
+// context which is to be used to derive Exchange contexts via
+// mycontroller.NewExchangeContext. See related ControllerFromContext to load a
+// controller context.
+func NewControllerContext(ctx context.Context) context.Context {
+	ctrlr := NewController()
+	return context.WithValue(ctx, controllerKey{}, ctrlr)
+}
+
+func ControllerFromContext(ctx context.Context) (Controller, error) {
+	ctrlr, ok := ctx.Value(controllerKey{}).(*controller)
+	if !ok {
+		return nil, ErrNoControllerContext
+	}
+	return ctrlr, nil
 }
 
 // NewExchangeContext is usually executed inside a HTTP handler function or MQ
@@ -227,6 +262,7 @@ func (c *controller) NewExchangeContext(ctx context.Context) context.Context {
 				}
 				return nil
 			})
+			axc.Delete(exchangeKey{})
 		}
 	}()
 	return newContext
@@ -238,6 +274,39 @@ func ExchangeFromContext(ctx context.Context) (Exchange, error) {
 		return nil, ErrNoExchangeInContext
 	}
 	return x, nil
+}
+
+func (c *controller) RegisterResponse(correlID string, response any, dropDuplicates ...bool) error {
+	for _, exchangeId := range c.contexts.Keys() {
+		ctx, ok := c.contexts.Load(exchangeId).(context.Context)
+		if !ok {
+			continue
+		}
+		xc, err := ExchangeFromContext(ctx)
+		if err != nil {
+			continue
+		}
+		if xc.HasRequest(correlID) {
+			return xc.RegisterResponse(correlID, response, dropDuplicates...)
+		}
+	}
+	return ErrHaveNoCorrelatedRequest
+}
+
+func (c *controller) RegisterRequestByContext(ctx context.Context, correlID string, request any, notificationChannelsOnResponse ...chan RequestResponse) error {
+	xc, ok := ctx.Value(exchangeKey{}).(atomix)
+	if !ok {
+		return ErrNoExchangeInContext
+	}
+	return xc.RegisterRequest(correlID, request, notificationChannelsOnResponse...)
+}
+
+func (c *controller) RegisterResponseByContext(ctx context.Context, correlID string, response any, dropDuplicates ...bool) error {
+	xc, ok := ctx.Value(exchangeKey{}).(atomix)
+	if !ok {
+		return ErrNoExchangeInContext
+	}
+	return xc.RegisterResponse(correlID, response, dropDuplicates...)
 }
 
 // Usage:
@@ -494,6 +563,15 @@ func (x atomix) RegisterResponse(correlID string, response any, dropDuplicates .
 		}
 		return nil
 	})
+}
+
+func (x atomix) HasRequest(correlID string) bool {
+	xc, ok := x.Load(exchangeKey{}).(exchange)
+	if !ok {
+		return false
+	}
+	_, exist := xc.requests[correlID]
+	return exist
 }
 
 func (x atomix) GetExchangeResult() ExchangeResult {
