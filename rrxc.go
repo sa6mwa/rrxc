@@ -22,8 +22,13 @@ import (
 
 // A controller handles multiple exchanges.
 type Controller interface {
+	NewControllerContext(ctx context.Context) context.Context
 	NewExchangeContext(ctx context.Context) context.Context
+	RegisterResponse(correlID string, response any, dropDuplicates ...bool) error
+	RegisterRequestByContext(ctx context.Context, correlID string, request any, notificationChannelsOnResponse ...chan RequestResponse) error
+	RegisterResponseByContext(ctx context.Context, correlID string, response any, dropDuplicates ...bool) error
 	Synchronize(ctx context.Context, operation func(sb SyncBundle) error) (ExchangeResult, error)
+	Wait(ctx context.Context) (ExchangeResult, error)
 	Tag(entity any, tag any, notificationChannels ...chan any)
 	Untag(entity any, tag any, notificationChannels ...chan any) error
 	HasTag(entity any, tags ...any) bool
@@ -36,6 +41,7 @@ type Exchange interface {
 	NewCorrelID() (correlID string)
 	RegisterRequest(correlID string, request any, notificationChannelsOnResponse ...chan RequestResponse) error
 	RegisterResponse(correlID string, response any, dropDuplicates ...bool) error
+	HasRequest(correlID string) bool
 	GetExchangeResult() ExchangeResult
 	GetRequestsAndResponses() []RequestResponse
 	GetRequest(correlID string) (any, error)
@@ -81,7 +87,11 @@ type RequestResponse struct {
 	Latency            time.Duration
 }
 
-// Key used to store and load the exchange strcut from the AnyStore in the
+// Key used to store and load the controller interface from the AnyStore in the
+// context value (of a context.Context).
+type controllerKey struct{}
+
+// Key used to store and load the exchange interface from the AnyStore in the
 // atomix struct.
 type exchangeKey struct{}
 
@@ -90,16 +100,19 @@ type exchangeKey struct{}
 // (public) interface as the Exchange interface is attached to the atomix
 // struct.
 type exchange struct {
-	id        string
-	created   time.Time
-	finished  time.Time
-	latency   time.Duration
-	requests  requestsMap
-	responses responsesMap
-	durable   bool // Not implemented yet
-	done      chan struct{}
-	closed    bool
-	succeeded bool
+	controller Controller
+	id         string
+	created    time.Time
+	finished   time.Time
+	latency    time.Duration
+	requests   requestsMap
+	responses  responsesMap
+	durable    bool // Not implemented yet
+	finalize   chan struct{}
+	finalized  bool
+	done       chan struct{}
+	closed     bool
+	succeeded  bool
 }
 
 // atomix wraps the exchange struct in an AnyStore and what all Exchange
@@ -141,6 +154,7 @@ type tagMap map[any]struct{}
 var NewID func() string = NewID256
 
 var (
+	ErrNoControllerContext  error = errors.New("context has no request/response controller")
 	ErrNoExchangeInContext  error = errors.New("context has no request/response exchange")
 	ErrUnableToLoadExchange error = errors.New("unable to load exchange, key not found")
 	ErrCorrelIDConflict     error = errors.New("correlation identifier conflict: already have a request with that correlID")
@@ -163,17 +177,43 @@ func NewController() Controller {
 	}
 }
 
+// Controller.NewControllerContext stores the already initiated controller in
+// ctx Values to be retrieved using rrxc.ControllerFromContext. Returns a
+// derived context.
+func (c *controller) NewControllerContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, controllerKey{}, c)
+}
+
+// NewControllerContext calls NewController and stores it in the context.Values
+// which is simple to load using rrxc.ControllerFromContext. Returns a derived
+// context which is to be used to derive Exchange contexts via
+// mycontroller.NewExchangeContext. See related ControllerFromContext to load a
+// controller context.
+func NewControllerContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, controllerKey{}, NewController())
+}
+
+func ControllerFromContext(ctx context.Context) (Controller, error) {
+	ctrlr, ok := ctx.Value(controllerKey{}).(*controller)
+	if !ok {
+		return nil, ErrNoControllerContext
+	}
+	return ctrlr, nil
+}
+
 // NewExchangeContext is usually executed inside a HTTP handler function or MQ
 // message handler function.
 //
 //	ctx := NewExchangeContext(context.Background())
 func (c *controller) NewExchangeContext(ctx context.Context) context.Context {
 	xc := exchange{
-		id:        NewID(),
-		created:   time.Now(),
-		requests:  make(requestsMap),
-		responses: make(responsesMap),
-		done:      make(chan struct{}),
+		controller: c,
+		id:         NewID(),
+		created:    time.Now(),
+		requests:   make(requestsMap),
+		responses:  make(responsesMap),
+		finalize:   make(chan struct{}),
+		done:       make(chan struct{}),
 	}
 	axc := atomix{
 		anystore.NewAnyStore(),
@@ -188,7 +228,7 @@ func (c *controller) NewExchangeContext(ctx context.Context) context.Context {
 		select {
 		case <-c.done:
 			tagForRollback = false
-		case <-xc.done:
+		case <-xc.finalize:
 		case <-newContext.Done():
 		}
 		c.contexts.Delete(xc.id)
@@ -219,7 +259,6 @@ func (c *controller) NewExchangeContext(ctx context.Context) context.Context {
 					}
 					if !grxc.closed {
 						grxc.closed = true
-						defer close(grxc.done)
 					}
 					grxc.finished = time.Now()
 					grxc.latency = grxc.finished.Sub(grxc.created)
@@ -228,6 +267,7 @@ func (c *controller) NewExchangeContext(ctx context.Context) context.Context {
 				return nil
 			})
 		}
+		close(xc.done)
 	}()
 	return newContext
 }
@@ -238,6 +278,39 @@ func ExchangeFromContext(ctx context.Context) (Exchange, error) {
 		return nil, ErrNoExchangeInContext
 	}
 	return x, nil
+}
+
+func (c *controller) RegisterResponse(correlID string, response any, dropDuplicates ...bool) error {
+	for _, exchangeId := range c.contexts.Keys() {
+		ctx, ok := c.contexts.Load(exchangeId).(context.Context)
+		if !ok {
+			continue
+		}
+		xc, err := ExchangeFromContext(ctx)
+		if err != nil {
+			continue
+		}
+		if xc.HasRequest(correlID) {
+			return xc.RegisterResponse(correlID, response, dropDuplicates...)
+		}
+	}
+	return ErrHaveNoCorrelatedRequest
+}
+
+func (c *controller) RegisterRequestByContext(ctx context.Context, correlID string, request any, notificationChannelsOnResponse ...chan RequestResponse) error {
+	xc, ok := ctx.Value(exchangeKey{}).(atomix)
+	if !ok {
+		return ErrNoExchangeInContext
+	}
+	return xc.RegisterRequest(correlID, request, notificationChannelsOnResponse...)
+}
+
+func (c *controller) RegisterResponseByContext(ctx context.Context, correlID string, response any, dropDuplicates ...bool) error {
+	xc, ok := ctx.Value(exchangeKey{}).(atomix)
+	if !ok {
+		return ErrNoExchangeInContext
+	}
+	return xc.RegisterResponse(correlID, response, dropDuplicates...)
 }
 
 // Usage:
@@ -258,6 +331,19 @@ func (c *controller) Synchronize(ctx context.Context, operation func(sb SyncBund
 	if err := operation(syncBundle); err != nil {
 		return ExchangeResult{}, err
 	}
+	select {
+	case <-ctx.Done():
+	case <-xc.Done():
+	}
+	return xc.GetExchangeResult(), nil
+}
+
+func (c *controller) Wait(ctx context.Context) (ExchangeResult, error) {
+	xc, err := ExchangeFromContext(ctx)
+	if err != nil {
+		return ExchangeResult{}, err
+	}
+	defer xc.Close()
 	select {
 	case <-ctx.Done():
 	case <-xc.Done():
@@ -340,6 +426,15 @@ func (c *controller) HasTag(entity any, tags ...any) bool {
 		}
 	}
 	return true
+}
+
+func CloseExchangeByContext(ctx context.Context) error {
+	xc, ok := ctx.Value(exchangeKey{}).(atomix)
+	if !ok {
+		return ErrNoExchangeInContext
+	}
+	xc.Close()
+	return nil
 }
 
 func (c *controller) Close() {
@@ -469,9 +564,9 @@ func (x atomix) RegisterResponse(correlID string, response any, dropDuplicates .
 		if closeExchange {
 			xc.succeeded = true
 		}
-		if closeExchange && !xc.closed {
-			xc.closed = true
-			defer close(xc.done)
+		if closeExchange && !xc.finalized {
+			xc.finalized = true
+			defer close(xc.finalize)
 		}
 		// Commit before notifying
 		a.Store(exchangeKey{}, xc)
@@ -494,6 +589,15 @@ func (x atomix) RegisterResponse(correlID string, response any, dropDuplicates .
 		}
 		return nil
 	})
+}
+
+func (x atomix) HasRequest(correlID string) bool {
+	xc, ok := x.Load(exchangeKey{}).(exchange)
+	if !ok {
+		return false
+	}
+	_, exist := xc.requests[correlID]
+	return exist
 }
 
 func (x atomix) GetExchangeResult() ExchangeResult {
@@ -580,9 +684,9 @@ func (x atomix) Close() {
 	x.Run(func(a anystore.AnyStore) error {
 		xc, ok := a.Load(exchangeKey{}).(exchange)
 		if ok {
-			if !xc.closed {
-				xc.closed = true
-				close(xc.done)
+			if !xc.finalized {
+				xc.finalized = true
+				close(xc.finalize)
 			}
 		}
 		a.Store(exchangeKey{}, xc)
