@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"runtime"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 
 func TestExchangeFromContext(t *testing.T) {
 	c := rrxc.NewController()
+	defer c.Close()
 	ctx := c.NewExchangeContext(context.Background())
 
 	c.Tag("hello", "something")
@@ -23,6 +25,7 @@ func TestExchangeFromContext(t *testing.T) {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer xc.Close()
 
 	ch := make(chan rrxc.RequestResponse)
 	go func() {
@@ -55,10 +58,6 @@ func TestExchangeFromContext(t *testing.T) {
 	}
 
 	time.Sleep(100 * time.Millisecond)
-
-	xc.Close()
-
-	time.Sleep(500 * time.Millisecond)
 }
 
 func TestController_Synchronize(t *testing.T) {
@@ -135,15 +134,16 @@ func TestController_Wait(t *testing.T) {
 
 	ctx = c.NewExchangeContext(ctx)
 
-	xc, err := rrxc.ExchangeFromContext(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// xc, err := rrxc.ExchangeFromContext(ctx)
+	// if err != nil {
+	// 	t.Fatal(err)
+	// }
 
 	for i := 0; i < 100; i++ {
 		id := fmt.Sprintf("abc%d", i)
 		//id := xc.NewCorrelID()
-		if err := xc.RegisterRequest(id, "hello world"); err != nil {
+		//if err := xc.RegisterRequest(id, "hello world"); err != nil {
+		if err := c.RegisterRequestByContext(ctx, id, "hello world"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -163,11 +163,19 @@ func TestController_Wait(t *testing.T) {
 		t.Fatalf("%s not tagged for rollback", taggedForRollback)
 	}
 
-	xc.Close()
+	if err := rrxc.CloseExchangeByContext(ctx); err != nil {
+		t.Fatal(err)
+	}
 
 	j, err := json.MarshalIndent(xcresult, "", "  ")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Log(string(j))
+
+	c.Close()
+
+	time.Sleep(200 * time.Millisecond)
+
+	t.Log("goroutines:", runtime.NumGoroutine())
 }

@@ -428,6 +428,15 @@ func (c *controller) HasTag(entity any, tags ...any) bool {
 	return true
 }
 
+func CloseExchangeByContext(ctx context.Context) error {
+	xc, ok := ctx.Value(exchangeKey{}).(atomix)
+	if !ok {
+		return ErrNoExchangeInContext
+	}
+	xc.Close()
+	return nil
+}
+
 func (c *controller) Close() {
 	close(c.done)
 }
