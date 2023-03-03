@@ -28,6 +28,7 @@ type Controller interface {
 	RegisterRequestByContext(ctx context.Context, correlID string, request any, notificationChannelsOnResponse ...chan RequestResponse) error
 	RegisterResponseByContext(ctx context.Context, correlID string, response any, dropDuplicates ...bool) error
 	Synchronize(ctx context.Context, operation func(sb SyncBundle) error) (ExchangeResult, error)
+	Wait(ctx context.Context) (ExchangeResult, error)
 	Tag(entity any, tag any, notificationChannels ...chan any)
 	Untag(entity any, tag any, notificationChannels ...chan any) error
 	HasTag(entity any, tags ...any) bool
@@ -99,16 +100,19 @@ type exchangeKey struct{}
 // (public) interface as the Exchange interface is attached to the atomix
 // struct.
 type exchange struct {
-	id        string
-	created   time.Time
-	finished  time.Time
-	latency   time.Duration
-	requests  requestsMap
-	responses responsesMap
-	durable   bool // Not implemented yet
-	done      chan struct{}
-	closed    bool
-	succeeded bool
+	controller Controller
+	id         string
+	created    time.Time
+	finished   time.Time
+	latency    time.Duration
+	requests   requestsMap
+	responses  responsesMap
+	durable    bool // Not implemented yet
+	finalize   chan struct{}
+	finalized  bool
+	done       chan struct{}
+	closed     bool
+	succeeded  bool
 }
 
 // atomix wraps the exchange struct in an AnyStore and what all Exchange
@@ -186,8 +190,7 @@ func (c *controller) NewControllerContext(ctx context.Context) context.Context {
 // mycontroller.NewExchangeContext. See related ControllerFromContext to load a
 // controller context.
 func NewControllerContext(ctx context.Context) context.Context {
-	ctrlr := NewController()
-	return context.WithValue(ctx, controllerKey{}, ctrlr)
+	return context.WithValue(ctx, controllerKey{}, NewController())
 }
 
 func ControllerFromContext(ctx context.Context) (Controller, error) {
@@ -204,11 +207,13 @@ func ControllerFromContext(ctx context.Context) (Controller, error) {
 //	ctx := NewExchangeContext(context.Background())
 func (c *controller) NewExchangeContext(ctx context.Context) context.Context {
 	xc := exchange{
-		id:        NewID(),
-		created:   time.Now(),
-		requests:  make(requestsMap),
-		responses: make(responsesMap),
-		done:      make(chan struct{}),
+		controller: c,
+		id:         NewID(),
+		created:    time.Now(),
+		requests:   make(requestsMap),
+		responses:  make(responsesMap),
+		finalize:   make(chan struct{}),
+		done:       make(chan struct{}),
 	}
 	axc := atomix{
 		anystore.NewAnyStore(),
@@ -223,7 +228,7 @@ func (c *controller) NewExchangeContext(ctx context.Context) context.Context {
 		select {
 		case <-c.done:
 			tagForRollback = false
-		case <-xc.done:
+		case <-xc.finalize:
 		case <-newContext.Done():
 		}
 		c.contexts.Delete(xc.id)
@@ -254,7 +259,6 @@ func (c *controller) NewExchangeContext(ctx context.Context) context.Context {
 					}
 					if !grxc.closed {
 						grxc.closed = true
-						defer close(grxc.done)
 					}
 					grxc.finished = time.Now()
 					grxc.latency = grxc.finished.Sub(grxc.created)
@@ -262,8 +266,8 @@ func (c *controller) NewExchangeContext(ctx context.Context) context.Context {
 				}
 				return nil
 			})
-			axc.Delete(exchangeKey{})
 		}
+		close(xc.done)
 	}()
 	return newContext
 }
@@ -327,6 +331,19 @@ func (c *controller) Synchronize(ctx context.Context, operation func(sb SyncBund
 	if err := operation(syncBundle); err != nil {
 		return ExchangeResult{}, err
 	}
+	select {
+	case <-ctx.Done():
+	case <-xc.Done():
+	}
+	return xc.GetExchangeResult(), nil
+}
+
+func (c *controller) Wait(ctx context.Context) (ExchangeResult, error) {
+	xc, err := ExchangeFromContext(ctx)
+	if err != nil {
+		return ExchangeResult{}, err
+	}
+	defer xc.Close()
 	select {
 	case <-ctx.Done():
 	case <-xc.Done():
@@ -538,9 +555,9 @@ func (x atomix) RegisterResponse(correlID string, response any, dropDuplicates .
 		if closeExchange {
 			xc.succeeded = true
 		}
-		if closeExchange && !xc.closed {
-			xc.closed = true
-			defer close(xc.done)
+		if closeExchange && !xc.finalized {
+			xc.finalized = true
+			defer close(xc.finalize)
 		}
 		// Commit before notifying
 		a.Store(exchangeKey{}, xc)
@@ -658,9 +675,9 @@ func (x atomix) Close() {
 	x.Run(func(a anystore.AnyStore) error {
 		xc, ok := a.Load(exchangeKey{}).(exchange)
 		if ok {
-			if !xc.closed {
-				xc.closed = true
-				close(xc.done)
+			if !xc.finalized {
+				xc.finalized = true
+				close(xc.finalize)
 			}
 		}
 		a.Store(exchangeKey{}, xc)

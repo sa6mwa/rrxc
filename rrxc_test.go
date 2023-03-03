@@ -4,6 +4,7 @@ package rrxc_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"testing"
@@ -60,7 +61,7 @@ func TestExchangeFromContext(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 }
 
-func TestControllerSync(t *testing.T) {
+func TestController_Synchronize(t *testing.T) {
 	c := rrxc.NewController()
 	intermediateCTX, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -75,29 +76,21 @@ func TestControllerSync(t *testing.T) {
 			t.Log(err)
 			return
 		}
-
 		for i := 0; i < 100; i++ {
 			id := fmt.Sprintf("abc%d", i)
-			if err := controller.RegisterResponse(id, "no comment "+id); err != nil {
+			if err := controller.RegisterResponse(id, "Hi there, "+id); err != nil {
 				t.Log(err)
 			}
 		}
-
 	}()
 
 	xcresult, err := c.Synchronize(c.NewExchangeContext(ctx), func(sb rrxc.SyncBundle) error {
 		for i := 0; i < 100; i++ {
-
 			id := fmt.Sprintf("abc%d", i)
-
 			//id := sb.Exchange.NewCorrelID()
 			if err := sb.Exchange.RegisterRequest(id, "hello world"); err != nil {
 				t.Fatal(err)
 			}
-
-			// if err := sb.Exchange.RegisterResponse(id, "hello there", true); err != nil {
-			// 	t.Fatal(err)
-			// }
 		}
 		close(ready)
 		return nil
@@ -106,6 +99,65 @@ func TestControllerSync(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Logf("%+v\n", xcresult)
+	j, err := json.MarshalIndent(xcresult, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Log(string(j))
+}
 
+func TestController_Wait(t *testing.T) {
+	intermediateCTX, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	ctx := rrxc.NewControllerContext(intermediateCTX)
+
+	c, err := rrxc.ControllerFromContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ready := make(chan struct{})
+
+	go func() {
+		<-ready
+		controller, err := rrxc.ControllerFromContext(ctx)
+		if err != nil {
+			t.Log(err)
+			return
+		}
+		for i := 0; i < 100; i++ {
+			id := fmt.Sprintf("abc%d", i)
+			if err := controller.RegisterResponse(id, "Hello there, "+id); err != nil {
+				t.Log(err)
+			}
+		}
+	}()
+
+	ctx = c.NewExchangeContext(ctx)
+
+	xc, err := rrxc.ExchangeFromContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 100; i++ {
+		id := fmt.Sprintf("abc%d", i)
+		//id := xc.NewCorrelID()
+		if err := xc.RegisterRequest(id, "hello world"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(ready)
+
+	xcresult, err := c.Wait(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	xc.Close()
+
+	j, err := json.MarshalIndent(xcresult, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Log(string(j))
 }
