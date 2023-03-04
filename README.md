@@ -9,37 +9,77 @@ controller - rrxc correlates requests with responses.
 This package is currently very much a MVP, examples and proper unit testing are
 in the backlog.
 
-See [rrxc_test.go](rrxc_test.go) for a crude example.
+See [rrxc_test.go](rrxc_test.go) for crude examples.
 
+## Design
+
+A new controller is instantiated via `ctrl := rrxc.NewController()` in the
+`main` function. In each call to the server handler that is to make asynchronous
+requests against remote system(s), a new exchange is initiated and attached to a
+`context.Context` (preferably with a timeout). The server handler initiates a
+new exchange by calling `ctx = ctrl.NewExchangeContext(ctx)`. A new *correlation
+identifier* or `correlID` needs to be requested using, for example, `correlID :=
+ctrl.NewCorrelID()`. Requests are registered in the exchange using one of the
+registration functions, e.g `rrxc.RegisterRequestByContext(ctx, correlID, "my
+message")`. If you are making more asynchronous requests in this exchange, you
+need to fetch another `correlID` using `ctrl.NewCorrelID()` and register the
+request the same way (via the controller or the exchange receiver function;
+`RegisterRequestByContext`, `RegisterRequest`). In the other server goroutine
+(perhaps a messaging queue consumer) you register responses via either the
+controller or the exchange interface stored in the context using
+`ExchangeFromContext(ctx)`. A response can simply be registered via `err :=
+ctrl.RegisterResponse(id, "my response")` and the controller will figure out
+which exchange the response should be registered in. In the requesting server
+handler function `ctrl.Wait()` can be used to wait until all responses have
+arrived. An alternative approach is to wrap everything in the `ctrl.Synchronize`
+function which will not exit until all requests are done or the context is
+cancelled (timed out). The results are returned by both `Synchronize` and `Wait`
+as an `ExchangeResult` struct. If any of the requests fail, the whole exchange
+will fail and could potentially be handled as a transaction to rollback. The
+controller keeps a map of *tags*. If the exchange is closed or the context is
+cancelled and has requests without responses, each `correlID` is tagged with the
+default rollback tag (`rollback`). These tags can be looked up in, for example,
+the message consumer handler if the remote system is setup to requeue
+un-acknowledged messages. That way you can handle the message and acknowledge
+it. The rollback tags are automatically removed from the tag map after
+`defaultRollbackTagLifespan` which is `3 * time.Hour` or
+`ctrl.SetRollbackTagLifespan(duration)`.
+
+A drawing illustrating the connection between controller(s), exchange(s) and
+request(s)/response(s).
 
 ```
-ok      github.com/sa6mwa/rrxc  0.713s  coverage: 57.3% of statements
-ok      github.com/sa6mwa/rrxc/pkg/anystore     0.003s  coverage: 63.0% of statements
-
-
-Request/Response eXchange Controller handles sync-over-async as well as fully
-asynchronous patterns correlating requests with responses.
-rrxc.go:196:11: Error return value of `axc.Run` is not checked (errcheck)
-			axc.Run(func(a anystore.AnyStore) error {
-			       ^
-rrxc.go:215:17: Error return value of `c.Untag` is not checked (errcheck)
-									c.Untag(correlID, "rollback")
-									       ^
-rrxc.go:272:17: Error return value of `c.mapOfMaps.Run` is not checked (errcheck)
-	c.mapOfMaps.Run(func(mm anystore.AnyStore) error {
-	               ^
-rrxc.go:352:11: Error return value of `rand.Read` is not checked (errcheck)
-	rand.Read(b) // Care not about errors
-	         ^
-rrxc.go:372:11: Error return value of `rand.Read` is not checked (errcheck)
-	rand.Read(b)
-	         ^
-rrxc.go:580:7: Error return value of `x.Run` is not checked (errcheck)
-	x.Run(func(a anystore.AnyStore) error {
-	     ^
-rrxc.go:99:2: field `durable` is unused (unused)
-	durable   bool // Not implemented yet
-	^
-pkg/anystore/anystore.go:119:10: S1005: unnecessary assignment to the blank identifier (gosimple)
-		for k, _ := range kv {
-```		       ^
+      ┌───────────────────────────┐     ┌───────────────────────────┐
+      │                           │     │                           │
+      │ a := rrxc.NewController() │     │ b := rrxc.NewController() │ ...
+      │                           │     │                           │
+      └──┬────────┬───────┬───────┘     └──┬─────────┬────────┬─────┘
+         │        │       │                │         │        │
+         │        │       │                │         │        │
+         │        │       │                │         │        │
+  ca := a.NewExchangeContext(ctx)      cb := b.NewExchangeContext(ctx)
+         │        │       │                │         │        │
+         │        │       │                │         │        │
+         │        │       │                │         │        │
+     ┌───▼──┐ ┌───▼──┐ ┌──▼───┐         ┌──▼───┐ ┌───▼──┐ ┌───▼──┐
+     │ Xchg │ │ Xchg │ │ Xchg │ ...     │ Xchg │ │ Xchg │ │ Xchg │ ...
+     └┬─┬─┬─┘ └┬─┬─┬─┘ └──────┘         └──────┘ └──┬───┘ └──────┘
+      │ │ │    │ │ │                                │
+      │ │ │    │ │ │                                │
+ a.RegisterRequestByContext(ca,...)   b.RegisterRequestByContext(cb,...)
+      │ │ │    │ │ │                                │
+      │ │ │    │ │ └─────────┐                      │
+      │ │ │    │ │           │                      │
+      │ │ │    │ └────┐      │                      │
+      │ │ │    │      │      │                   ┌──▼─┐
+      │ │ │  ┌─▼──┐ ┌─▼──┐ ┌─▼──┐                │ RR │ ...
+      │ │ │  │ RR │ │ RR │ │ RR │ ...            └────┘
+      │ │ │  └────┘ └────┘ └────┘            Request/Response
+      │ │ │
+   ┌──┘ │ └─────┐
+   │    │       │
+┌──▼─┐ ┌▼───┐ ┌─▼──┐
+│ RR │ │ RR │ │ RR │ ...
+└────┘ └────┘ └────┘
+  Request/Response
+```
