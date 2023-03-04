@@ -275,6 +275,19 @@ func RegisterResponseByContext(ctx context.Context, correlID string, response an
 	return xc.RegisterResponse(correlID, response, dropDuplicates...)
 }
 
+func Wait(ctx context.Context) (ExchangeResult, error) {
+	xc, err := ExchangeFromContext(ctx)
+	if err != nil {
+		return ExchangeResult{}, err
+	}
+	defer xc.Close()
+	select {
+	case <-ctx.Done():
+	case <-xc.Done():
+	}
+	return xc.GetExchangeResult(), nil
+}
+
 func CloseExchangeByContext(ctx context.Context) error {
 	xc, ok := ctx.Value(exchangeKey{}).(atomix)
 	if !ok {
