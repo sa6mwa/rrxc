@@ -1,8 +1,45 @@
-// Package rrxc is a Request/Response eXchange Controller for synchronizing an
-// operation against remote asynchronous backends (AKA sync/async or
-// sync-over-async). The package does not exclusively support sync-over-async as
-// an exchange in rrxc can very well be fully asynchronous, why it was named a
-// controller - rrxc correlates requests with responses.
+/*
+Package rrxc is a Request/Response eXchange Controller for synchronizing an
+operation against remote asynchronous backends (AKA sync/async or
+sync-over-async). The package does not exclusively support sync-over-async as
+an exchange in rrxc can very well be fully asynchronous, why it was named a
+controller - rrxc correlates requests with responses.
+
+Example usages:
+
+	// In main, before starting the http server and queue consumers...
+
+	controller := rrxc.NewController()
+
+	// In the http server handler...
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	xc := controller.NewExchangeFromContext(ctx)
+	defer xc.Close()
+	// Use ID in your outgoing message, the other side would have to include it in their response.
+	id := xc.NewCorrelID()
+	if err := xc.RegisterRequest(id, "hello world"); err != nil {
+		return err
+	}
+	producer.Publish(queue, "hello world")
+	result, err := controller.Wait() // wait for RegisterResponse (in msghandler below)
+	if err != nil {
+		return err
+	}
+
+	// In the message handler (consumer, in the same app as the http server)...
+
+	if controller.HasTag(correlatingID, "rollback") {
+		controller.Untag(correlatingID, "rollback")
+		// Silently ACK a rollback-message
+		return nil
+	}
+
+	if err := controller.RegisterResponse(correlatingID, "Hello there"); err != nil {
+		return err
+	}
+*/
 package rrxc
 
 import (
@@ -11,6 +48,7 @@ import (
 	"crypto/sha512"
 	"encoding/hex"
 	"errors"
+	"log"
 	"time"
 
 	"github.com/sa6mwa/rrxc/pkg/anystore"
@@ -24,6 +62,8 @@ import (
 type Controller interface {
 	NewControllerContext(ctx context.Context) context.Context
 	NewExchangeContext(ctx context.Context) context.Context
+	HasRequest(correlID string) bool
+	GetRequestAge(correlID string) (time.Duration, error)
 	RegisterResponse(correlID string, response any, dropDuplicates ...bool) error
 	RegisterRequestByContext(ctx context.Context, correlID string, request any, notificationChannelsOnResponse ...chan RequestResponse) error
 	RegisterResponseByContext(ctx context.Context, correlID string, response any, dropDuplicates ...bool) error
@@ -44,6 +84,7 @@ type Exchange interface {
 	HasRequest(correlID string) bool
 	GetExchangeResult() ExchangeResult
 	GetRequestsAndResponses() []RequestResponse
+	GetRequestAge(correlID string) (time.Duration, error)
 	GetRequest(correlID string) (any, error)
 	GetResponse(correlID string) (any, error)
 
@@ -280,9 +321,49 @@ func ExchangeFromContext(ctx context.Context) (Exchange, error) {
 	return x, nil
 }
 
+func (c *controller) HasRequest(correlID string) bool {
+	for _, exchangeID := range c.contexts.Keys() {
+		ctx, ok := c.contexts.Load(exchangeID).(context.Context)
+		if !ok {
+			continue
+		}
+		xc, err := ExchangeFromContext(ctx)
+		if err != nil {
+			log.Print("[ERROR] Unable to load exchange from context")
+			continue
+		}
+		if xc.HasRequest(correlID) {
+			return true
+		}
+	}
+	return false
+}
+
+// Returns age of request and true if requests or false if request does no
+// exist.
+func (c *controller) GetRequestAge(correlID string) (time.Duration, error) {
+	for _, exchangeID := range c.contexts.Keys() {
+		ctx, ok := c.contexts.Load(exchangeID).(context.Context)
+		if !ok {
+			continue
+		}
+		xc, err := ExchangeFromContext(ctx)
+		if err != nil {
+			log.Print("[ERROR] Unable to load exchange from context")
+			continue
+		}
+		r, err := xc.GetRequestAge(correlID)
+		if err != nil {
+			continue
+		}
+		return r, nil
+	}
+	return -1, ErrNoSuchRequest
+}
+
 func (c *controller) RegisterResponse(correlID string, response any, dropDuplicates ...bool) error {
-	for _, exchangeId := range c.contexts.Keys() {
-		ctx, ok := c.contexts.Load(exchangeId).(context.Context)
+	for _, exchangeID := range c.contexts.Keys() {
+		ctx, ok := c.contexts.Load(exchangeID).(context.Context)
 		if !ok {
 			continue
 		}
@@ -667,6 +748,18 @@ func (x atomix) GetResponse(correlID string) (any, error) {
 		return nil, ErrNoSuchResponse
 	}
 	return r.response, nil
+}
+
+func (x atomix) GetRequestAge(correlID string) (time.Duration, error) {
+	xc, ok := x.Load(exchangeKey{}).(exchange)
+	if !ok {
+		return -1, ErrUnableToLoadExchange
+	}
+	r, found := xc.requests[correlID]
+	if !found {
+		return -1, ErrNoSuchRequest
+	}
+	return time.Now().Sub(r.created), nil
 }
 
 func (x atomix) Done() <-chan struct{} {

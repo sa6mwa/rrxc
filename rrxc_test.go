@@ -87,9 +87,11 @@ func TestController_Synchronize(t *testing.T) {
 		for i := 0; i < 100; i++ {
 			id := fmt.Sprintf("abc%d", i)
 			//id := sb.Exchange.NewCorrelID()
+
 			if err := sb.Exchange.RegisterRequest(id, "hello world"); err != nil {
 				t.Fatal(err)
 			}
+
 		}
 		close(ready)
 		return nil
