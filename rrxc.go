@@ -57,13 +57,15 @@ import (
 )
 
 const (
-	defaultRollbackTag string = "rollback"
+	defaultRollbackTag         string        = "rollback"
+	defaultRollbackTagLifespan time.Duration = 3 * time.Hour
 )
 
 // A controller handles multiple exchanges.
 type Controller interface {
 	SetRollbackTag(tag string) Controller
 	GetRollbackTag() string
+	SetRollbackTagLifespan(d time.Duration) Controller
 	NewControllerContext(ctx context.Context) context.Context
 	NewExchangeContext(ctx context.Context) context.Context
 	NewCorrelID() string
@@ -139,11 +141,12 @@ type RequestResponse struct {
 type controllerKey struct{}
 
 type controller struct {
-	contexts    anystore.AnyStore
-	mapOfMaps   anystore.AnyStore // map[any]any = make(map[any]any))
-	rollbackTag atomic.Value
-	closed      atomic.Value
-	done        chan struct{}
+	contexts            anystore.AnyStore
+	mapOfMaps           anystore.AnyStore // map[any]any = make(map[any]any))
+	rollbackTag         atomic.Value
+	rollbackTagLifespan atomic.Value
+	closed              atomic.Value
+	done                chan struct{}
 }
 
 type tagMap map[any]struct{}
@@ -227,6 +230,7 @@ func NewController() Controller {
 		done:      make(chan struct{}),
 	}
 	ctrlr.rollbackTag.Store(defaultRollbackTag)
+	ctrlr.rollbackTagLifespan.Store(defaultRollbackTagLifespan)
 	return ctrlr
 }
 
@@ -253,6 +257,22 @@ func ExchangeFromContext(ctx context.Context) (Exchange, error) {
 		return nil, ErrNoExchangeInContext
 	}
 	return x, nil
+}
+
+func RegisterRequestByContext(ctx context.Context, correlID string, request any, notificationChannelsOnResponse ...chan RequestResponse) error {
+	xc, ok := ctx.Value(exchangeKey{}).(atomix)
+	if !ok {
+		return ErrNoExchangeInContext
+	}
+	return xc.RegisterRequest(correlID, request, notificationChannelsOnResponse...)
+}
+
+func RegisterResponseByContext(ctx context.Context, correlID string, response any, dropDuplicates ...bool) error {
+	xc, ok := ctx.Value(exchangeKey{}).(atomix)
+	if !ok {
+		return ErrNoExchangeInContext
+	}
+	return xc.RegisterResponse(correlID, response, dropDuplicates...)
 }
 
 func CloseExchangeByContext(ctx context.Context) error {
@@ -337,6 +357,13 @@ func (c *controller) GetRollbackTag() string {
 	return c.rollbackTag.Load().(string)
 }
 
+// SetRollbacktagLifespan sets the timeout until the rollback tag is removed
+// (default 3h). A value of 0 disables the timeout (not recommended).
+func (c *controller) SetRollbackTagLifespan(d time.Duration) Controller {
+	c.rollbackTagLifespan.Store(d)
+	return c
+}
+
 // Controller.NewControllerContext stores the already initiated controller in
 // ctx Values to be retrieved using rrxc.ControllerFromContext. Returns a
 // derived context.
@@ -383,17 +410,22 @@ func (c *controller) NewExchangeContext(ctx context.Context) context.Context {
 						for correlID, r := range grxc.requests {
 							if !r.completed {
 								c.Tag(correlID, c.rollbackTag.Load().(string))
+								to := c.rollbackTagLifespan.Load().(time.Duration)
 								// The following goroutine will remove the rollback tag from
 								// this correlID after 24 hours or when/if the controller is
 								// closed (c never sends anything on c.done, just closes it).
 								go func(cid string) {
-									t := time.NewTimer(24 * time.Hour)
-									select {
-									case <-t.C:
-									case <-c.done:
-										if !t.Stop() {
-											<-t.C
+									if to > 0 {
+										t := time.NewTimer(to)
+										select {
+										case <-t.C:
+										case <-c.done:
+											if !t.Stop() {
+												<-t.C
+											}
 										}
+									} else {
+										<-c.done
 									}
 									c.Untag(cid, c.rollbackTag.Load().(string))
 								}(correlID)
