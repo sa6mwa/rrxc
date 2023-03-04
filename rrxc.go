@@ -49,19 +49,24 @@ import (
 	"encoding/hex"
 	"errors"
 	"log"
+	"sync/atomic"
 	"time"
 
 	"github.com/sa6mwa/rrxc/pkg/anystore"
 	"golang.org/x/net/context"
 )
 
-// Main exchange handler below. Works like context.Context, returns an
-// interface.
+const (
+	defaultRollbackTag string = "rollback"
+)
 
 // A controller handles multiple exchanges.
 type Controller interface {
+	SetRollbackTag(tag string) Controller
+	GetRollbackTag() string
 	NewControllerContext(ctx context.Context) context.Context
 	NewExchangeContext(ctx context.Context) context.Context
+	NewCorrelID() string
 	HasRequest(correlID string) bool
 	GetRequestAge(correlID string) (time.Duration, error)
 	RegisterResponse(correlID string, response any, dropDuplicates ...bool) error
@@ -77,20 +82,21 @@ type Controller interface {
 
 // An exchange is a set of request/response pairs (or just one pair).
 type Exchange interface {
+	Controller() (Controller, error)
 	GetID() string
-	NewCorrelID() (correlID string)
+	NewCorrelID() string
+	HasCorrelID(correlID string) bool
+	HasRequest(correlID string) bool
+	GetRequestAge(correlID string) (time.Duration, error)
 	RegisterRequest(correlID string, request any, notificationChannelsOnResponse ...chan RequestResponse) error
 	RegisterResponse(correlID string, response any, dropDuplicates ...bool) error
-	HasRequest(correlID string) bool
 	GetExchangeResult() ExchangeResult
 	GetRequestsAndResponses() []RequestResponse
-	GetRequestAge(correlID string) (time.Duration, error)
 	GetRequest(correlID string) (any, error)
 	GetResponse(correlID string) (any, error)
 
-	// Done returns a receive-only channel which is closed when there has been at
-	// least one successfully exchanged request/response pair (or context has been
-	// cancelled).
+	// Done returns a receive-only channel which is closed when all requests in
+	// the exchange have been responded to. It will also close
 	Done() <-chan struct{}
 	Close()
 }
@@ -131,6 +137,16 @@ type RequestResponse struct {
 // Key used to store and load the controller interface from the AnyStore in the
 // context value (of a context.Context).
 type controllerKey struct{}
+
+type controller struct {
+	contexts    anystore.AnyStore
+	mapOfMaps   anystore.AnyStore // map[any]any = make(map[any]any))
+	rollbackTag atomic.Value
+	closed      atomic.Value
+	done        chan struct{}
+}
+
+type tagMap map[any]struct{}
 
 // Key used to store and load the exchange interface from the AnyStore in the
 // atomix struct.
@@ -179,14 +195,6 @@ type responseStruct struct {
 	registered time.Time
 }
 
-type controller struct {
-	contexts  anystore.AnyStore
-	mapOfMaps anystore.AnyStore // map[any]any = make(map[any]any))
-	done      chan struct{}
-}
-
-type tagMap map[any]struct{}
-
 // Default NewID function is NewID256 returning a hex-encoded sha256 string
 // based of a random number. NewID256 can be replaced by a custom function or
 // the other provided function NewID256...
@@ -207,22 +215,19 @@ var (
 	ErrDuplicate               error = errors.New("duplicate response: have already registered a response for this correlation identifier")
 )
 
+// Start with all non-receiver functions
+
 // NewController is initialized before starting HTTP servers or message
 // handlers, usually in the main function. The return Controller should be used
 // in HandleFuncs and message handlers.
 func NewController() Controller {
-	return &controller{ // Does not need to be a pointer, but became confusing if it wasn't.
+	ctrlr := &controller{
 		contexts:  anystore.NewAnyStore(),
 		mapOfMaps: anystore.NewAnyStore(),
 		done:      make(chan struct{}),
 	}
-}
-
-// Controller.NewControllerContext stores the already initiated controller in
-// ctx Values to be retrieved using rrxc.ControllerFromContext. Returns a
-// derived context.
-func (c *controller) NewControllerContext(ctx context.Context) context.Context {
-	return context.WithValue(ctx, controllerKey{}, c)
+	ctrlr.rollbackTag.Store(defaultRollbackTag)
+	return ctrlr
 }
 
 // NewControllerContext calls NewController and stores it in the context.Values
@@ -240,6 +245,103 @@ func ControllerFromContext(ctx context.Context) (Controller, error) {
 		return nil, ErrNoControllerContext
 	}
 	return ctrlr, nil
+}
+
+func ExchangeFromContext(ctx context.Context) (Exchange, error) {
+	x, ok := ctx.Value(exchangeKey{}).(atomix)
+	if !ok {
+		return nil, ErrNoExchangeInContext
+	}
+	return x, nil
+}
+
+func CloseExchangeByContext(ctx context.Context) error {
+	xc, ok := ctx.Value(exchangeKey{}).(atomix)
+	if !ok {
+		return ErrNoExchangeInContext
+	}
+	xc.Close()
+	return nil
+}
+
+// NewID256 returns a random hex-encoded sha256 hash as a string.
+func NewID256() string {
+	b := make([]byte, 128)
+	rand.Read(b) // Care not about errors
+	h := sha256.New()
+	n := time.Now().UTC().UnixNano()
+	nanobytes := []byte{
+		byte(0xff & n),
+		byte(0xff & (n >> 8)),
+		byte(0xff & (n >> 16)),
+		byte(0xff & (n >> 24)),
+		byte(0xff & (n >> 32)),
+		byte(0xff & (n >> 40)),
+		byte(0xff & (n >> 48)),
+		byte(0xff & (n >> 56)),
+	}
+	h.Write(append(b, nanobytes...))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// NewID512 returns a random hex-encoded sha512 hash as a string.
+func NewID512() string {
+	b := make([]byte, 256)
+	rand.Read(b)
+	h := sha512.New()
+	n := time.Now().UTC().UnixNano()
+	nanobytes := []byte{
+		byte(0xff & n),
+		byte(0xff & (n >> 8)),
+		byte(0xff & (n >> 16)),
+		byte(0xff & (n >> 24)),
+		byte(0xff & (n >> 32)),
+		byte(0xff & (n >> 40)),
+		byte(0xff & (n >> 48)),
+		byte(0xff & (n >> 56)),
+	}
+	h.Write(append(b, nanobytes...))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// Controller interface
+
+func (c *controller) GetExchangeByCorrelID(correlID string) (Exchange, error) {
+	for _, exchangeID := range c.contexts.Keys() {
+		ctx, ok := c.contexts.Load(exchangeID).(context.Context)
+		if !ok {
+			continue
+		}
+		xc, err := ExchangeFromContext(ctx)
+		if err != nil {
+			continue
+		}
+		if xc.HasRequest(correlID) {
+			return xc, nil
+		}
+	}
+	return nil, ErrHaveNoCorrelatedRequest
+}
+
+// Controller_SetRollbackTag sets the name of the rollback tag (by default "rollback")
+// which a correlID is tagged with when a request in an exchange context is not
+// responded to when the exchange is terminated by a cancelled context.
+func (c *controller) SetRollbackTag(tag string) Controller {
+	c.rollbackTag.Store(tag)
+	return c
+}
+
+// Controller_GetRollbackTag returns the configured rollback tag (default
+// "rollback").
+func (c *controller) GetRollbackTag() string {
+	return c.rollbackTag.Load().(string)
+}
+
+// Controller.NewControllerContext stores the already initiated controller in
+// ctx Values to be retrieved using rrxc.ControllerFromContext. Returns a
+// derived context.
+func (c *controller) NewControllerContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, controllerKey{}, c)
 }
 
 // NewExchangeContext is usually executed inside a HTTP handler function or MQ
@@ -280,11 +382,11 @@ func (c *controller) NewExchangeContext(ctx context.Context) context.Context {
 					if tagForRollback {
 						for correlID, r := range grxc.requests {
 							if !r.completed {
-								c.Tag(correlID, "rollback")
+								c.Tag(correlID, c.rollbackTag.Load().(string))
 								// The following goroutine will remove the rollback tag from
 								// this correlID after 24 hours or when/if the controller is
 								// closed (c never sends anything on c.done, just closes it).
-								go func() {
+								go func(cid string) {
 									t := time.NewTimer(24 * time.Hour)
 									select {
 									case <-t.C:
@@ -293,8 +395,8 @@ func (c *controller) NewExchangeContext(ctx context.Context) context.Context {
 											<-t.C
 										}
 									}
-									c.Untag(correlID, "rollback")
-								}()
+									c.Untag(cid, c.rollbackTag.Load().(string))
+								}(correlID)
 							}
 						}
 					}
@@ -313,12 +415,30 @@ func (c *controller) NewExchangeContext(ctx context.Context) context.Context {
 	return newContext
 }
 
-func ExchangeFromContext(ctx context.Context) (Exchange, error) {
-	x, ok := ctx.Value(exchangeKey{}).(atomix)
-	if !ok {
-		return nil, ErrNoExchangeInContext
+func (c *controller) NewCorrelID() string {
+	correlID := NewID()
+	for {
+		hasCorrelID := false
+		for _, exchangeID := range c.contexts.Keys() {
+			ctx, ok := c.contexts.Load(exchangeID).(context.Context)
+			if !ok {
+				continue
+			}
+			xc, err := ExchangeFromContext(ctx)
+			if err != nil {
+				log.Print("[ERROR] Unable to load exchange from context")
+				continue
+			}
+			if xc.HasCorrelID(correlID) {
+				hasCorrelID = true
+				continue
+			}
+		}
+		if !hasCorrelID {
+			break
+		}
 	}
-	return x, nil
+	return correlID
 }
 
 func (c *controller) HasRequest(correlID string) bool {
@@ -397,7 +517,9 @@ func (c *controller) RegisterResponseByContext(ctx context.Context, correlID str
 // Usage:
 //
 //	ctrl := rrxc.NewController()
-//	ctrl.Sync(rrxc.ExchangeFromContext(context.WithTimeout(context.Background(), 15 * time.Second), func( context.Context, ) ))
+//	xcresult, err := ctrl.Synchronize(rrxc.ExchangeFromContext(context.WithTimeout(context.Background(), 15 * time.Second), func(sb SyncBundle) error {
+//		sb.Exchange.RegisterRequest(...)
+//	}))
 func (c *controller) Synchronize(ctx context.Context, operation func(sb SyncBundle) error) (ExchangeResult, error) {
 	xc, err := ExchangeFromContext(ctx)
 	if err != nil {
@@ -509,60 +631,28 @@ func (c *controller) HasTag(entity any, tags ...any) bool {
 	return true
 }
 
-func CloseExchangeByContext(ctx context.Context) error {
-	xc, ok := ctx.Value(exchangeKey{}).(atomix)
-	if !ok {
-		return ErrNoExchangeInContext
-	}
-	xc.Close()
-	return nil
-}
-
 func (c *controller) Close() {
-	close(c.done)
-}
-
-// NewID256 returns a random hex-encoded sha256 hash as a string.
-func NewID256() string {
-	b := make([]byte, 128)
-	rand.Read(b) // Care not about errors
-	h := sha256.New()
-	n := time.Now().UTC().UnixNano()
-	nanobytes := []byte{
-		byte(0xff & n),
-		byte(0xff & (n >> 8)),
-		byte(0xff & (n >> 16)),
-		byte(0xff & (n >> 24)),
-		byte(0xff & (n >> 32)),
-		byte(0xff & (n >> 40)),
-		byte(0xff & (n >> 48)),
-		byte(0xff & (n >> 56)),
+	if c.closed.Load() == nil {
+		c.closed.Store(struct{}{})
+		close(c.done)
 	}
-	h.Write(append(b, nanobytes...))
-	return hex.EncodeToString(h.Sum(nil))
 }
 
-// NewID512 returns a random hex-encoded sha512 hash as a string.
-func NewID512() string {
-	b := make([]byte, 256)
-	rand.Read(b)
-	h := sha512.New()
-	n := time.Now().UTC().UnixNano()
-	nanobytes := []byte{
-		byte(0xff & n),
-		byte(0xff & (n >> 8)),
-		byte(0xff & (n >> 16)),
-		byte(0xff & (n >> 24)),
-		byte(0xff & (n >> 32)),
-		byte(0xff & (n >> 40)),
-		byte(0xff & (n >> 48)),
-		byte(0xff & (n >> 56)),
-	}
-	h.Write(append(b, nanobytes...))
-	return hex.EncodeToString(h.Sum(nil))
-}
-
+// Exchange interface
+//
 // Receiver functions attached to atomix implement the Exchange interface.
+
+// Exchange_Controller returns the controller attached to this exchange so that
+// you can do controller operations even if you only access to an exchange
+// context. Can not be used as a chained method as it returns error if the
+// exchange could not be retrieved.
+func (x atomix) Controller() (Controller, error) {
+	xc, ok := x.Load(exchangeKey{}).(exchange)
+	if !ok {
+		return nil, ErrUnableToLoadExchange
+	}
+	return xc.controller, nil
+}
 
 func (x atomix) GetID() string {
 	xc, ok := x.Load(exchangeKey{}).(exchange)
@@ -572,24 +662,25 @@ func (x atomix) GetID() string {
 	return xc.id
 }
 
-func (x atomix) NewCorrelID() (correlID string) {
+func (x atomix) NewCorrelID() string {
 	xc, ok := x.Load(exchangeKey{}).(exchange)
 	if !ok {
 		// Instead of panicking, just return a NewID, the risk that it already
 		// exists as an ID or CorrelID in this exchange is still extremely remote.
 		return NewID()
 	}
-	for {
-		correlID = NewID()
-		if correlID == xc.id {
-			continue
-		}
-		_, exist := xc.requests[correlID]
-		if !exist {
-			break
-		}
+	return xc.controller.NewCorrelID()
+}
+
+// HasCorrelID returns true if this exchange has correlID as an identifier of a
+// request/response. Returns false if not.
+func (x atomix) HasCorrelID(correlID string) bool {
+	xc, ok := x.Load(exchangeKey{}).(exchange)
+	if !ok {
+		return false
 	}
-	return
+	_, exist := xc.requests[correlID]
+	return exist
 }
 
 // notificationChannelsOnResponse are synchronous, if one in the list blocks on
@@ -759,7 +850,7 @@ func (x atomix) GetRequestAge(correlID string) (time.Duration, error) {
 	if !found {
 		return -1, ErrNoSuchRequest
 	}
-	return time.Now().Sub(r.created), nil
+	return time.Now().Sub(r.registered), nil
 }
 
 func (x atomix) Done() <-chan struct{} {
