@@ -136,3 +136,26 @@ rrxc.RegisterRequestByContext(ca,...)  rrxc.RegisterRequestByContext(cb,...)
 └────┘ └────┘ └────┘
   Request/Response
 ```
+
+
+## Bugs
+
+The following appeared during load testing...
+
+```
+fatal error: concurrent map read and map write
+
+goroutine 47431 [running]:
+github.com/sa6mwa/rrxc.atomix.HasCorrelID({{0x7d1520?, 0xc0000a5440?}}, {0xc0002d5a00, 0x40})
+        /some/dir/go/pkg/mod/github.com/sa6mwa/rrxc@v0.0.0-20230305211820-0bf9a9e490b8/rrxc.go:849 +0xfa
+github.com/sa6mwa/rrxc.(*controller).NewCorrelID(0xc0000602a0)
+        /some/dir/go/pkg/mod/github.com/sa6mwa/rrxc@v0.0.0-20230305211820-0bf9a9e490b8/rrxc.go:619 +0x1a7
+main.main.func2({0x7d0128, 0xc0000a1a40}, 0xc00041fc00)
+        /some/dir/lab/cmd/calculator-api-server/main.go:237 +0x33a
+net/http.HandlerFunc.ServeHTTP(0xc000072af0?, {0x7d0128?, 0xc0000a1a40?}, 0x0?)
+        /usr/local/go/src/net/http/server.go:2109 +0x2f
+net/http.(*ServeMux).ServeHTTP(0xc000023ade?, {0x7d0128, 0xc0000a1a40}, 0xc00041fc00)
+        /usr/local/go/src/net/http/server.go:2487 +0x149
+net/http.serverHandler.ServeHTTP({0xc000387500?}, {0x7d0128, 0xc0000a1a40}, 0xc00041fc00)
+        /usr/local/go/src/net/http/server.go:2947 +0x30c
+```

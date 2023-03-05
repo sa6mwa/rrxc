@@ -301,8 +301,8 @@ type exchange struct {
 	created    time.Time
 	finished   time.Time
 	latency    time.Duration
-	requests   requestsMap
-	responses  responsesMap
+	requests   anystore.AnyStore
+	responses  anystore.AnyStore
 	durable    bool // Not implemented yet
 	finalize   chan struct{}
 	finalized  bool
@@ -317,8 +317,8 @@ type atomix struct {
 	anystore.AnyStore
 }
 
-type requestsMap map[string]requestStruct
-type responsesMap map[string]responseStruct
+//type requestsMap map[string]requestStruct
+//type responsesMap map[string]responseStruct
 
 // An instance of requestStruct is stored as the value of the requests
 // correlationIdentifierMap in an exchange instance.
@@ -535,8 +535,8 @@ func (c *controller) NewExchangeContext(ctx context.Context) context.Context {
 		controller: c,
 		id:         NewID(),
 		created:    time.Now(),
-		requests:   make(requestsMap),
-		responses:  make(responsesMap),
+		requests:   anystore.NewAnyStore(),
+		responses:  anystore.NewAnyStore(),
 		finalize:   make(chan struct{}),
 		done:       make(chan struct{}),
 	}
@@ -562,7 +562,11 @@ func (c *controller) NewExchangeContext(ctx context.Context) context.Context {
 				grxc, ok := a.Load(exchangeKey{}).(exchange)
 				if ok {
 					if tagForRollback {
-						for correlID, r := range grxc.requests {
+						for _, correlID := range grxc.requests.Keys() {
+							r, ok := grxc.requests.Load(correlID).(requestStruct)
+							if !ok {
+								continue
+							}
 							if !r.completed {
 								c.Tag(correlID, c.rollbackTag.Load().(string))
 								to := c.rollbackTagLifespan.Load().(time.Duration)
@@ -583,7 +587,7 @@ func (c *controller) NewExchangeContext(ctx context.Context) context.Context {
 										<-c.done
 									}
 									c.Untag(cid, c.rollbackTag.Load().(string))
-								}(correlID)
+								}(correlID.(string))
 							}
 						}
 					}
@@ -846,7 +850,7 @@ func (x atomix) HasCorrelID(correlID string) bool {
 	if !ok {
 		return false
 	}
-	_, exist := xc.requests[correlID]
+	_, exist := xc.requests.Load(correlID).(requestStruct)
 	return exist
 }
 
@@ -856,11 +860,11 @@ func (x atomix) RegisterRequest(r *Registration) error {
 		if !ok {
 			return ErrUnableToLoadExchange
 		}
-		xc.requests[r.CorrelID] = requestStruct{ // requestStruct should not be a pointer
+		xc.requests.Store(r.CorrelID, requestStruct{
 			request:                        r.Message,
 			registered:                     time.Now(),
 			notificationChannelsOnResponse: r.NotifyOnResponse,
-		}
+		})
 		// Commit changes
 		a.Store(exchangeKey{}, xc)
 		return nil
@@ -873,27 +877,31 @@ func (x atomix) RegisterResponse(r *Registration) error {
 		if !ok {
 			return ErrUnableToLoadExchange
 		}
-		request, exist := xc.requests[r.CorrelID]
+		request, exist := xc.requests.Load(r.CorrelID).(requestStruct)
 		if !exist {
 			return ErrHaveNoCorrelatedRequest
 		}
-		if _, exist := xc.responses[r.CorrelID]; exist && !r.OverwriteOnDuplicate {
+		if _, exist := xc.responses.Load(r.CorrelID).(responseStruct); exist && !r.OverwriteOnDuplicate {
 			if r.FailOnDuplicate {
 				return ErrDuplicate
 			}
 			return nil
 		}
 		request.completed = true
-		xc.requests[r.CorrelID] = request
+		xc.requests.Store(r.CorrelID, request)
 		timeRegistered := time.Now()
-		xc.responses[r.CorrelID] = responseStruct{
+		xc.responses.Store(r.CorrelID, responseStruct{
 			response:   r.Message,
 			registered: timeRegistered,
-		}
+		})
 		// If all requests have been responded to, we are done, you can not add
 		// another request after the last response has finished.
 		closeExchange := true
-		for _, r := range xc.requests {
+		for _, cid := range xc.requests.Keys() {
+			r, ok := xc.requests.Load(cid).(requestStruct)
+			if !ok {
+				continue
+			}
 			if !r.completed {
 				closeExchange = false
 			}
@@ -933,7 +941,7 @@ func (x atomix) HasRequest(correlID string) bool {
 	if !ok {
 		return false
 	}
-	_, exist := xc.requests[correlID]
+	_, exist := xc.requests.Load(correlID).(requestStruct)
 	return exist
 }
 
@@ -964,13 +972,17 @@ func (x atomix) GetRequestsAndResponses() []RequestResponse {
 		return []RequestResponse{}
 	}
 	rnr := make([]RequestResponse, 0)
-	for cid, req := range xc.requests {
+	for _, cid := range xc.requests.Keys() {
+		req, ok := xc.requests.Load(cid).(requestStruct)
+		if !ok {
+			continue
+		}
 		rr := RequestResponse{
-			CorrelID:          cid,
+			CorrelID:          cid.(string),
 			Request:           req.request,
 			RequestRegistered: req.registered,
 		}
-		resp, gotResponse := xc.responses[cid]
+		resp, gotResponse := xc.responses.Load(cid).(responseStruct)
 		if gotResponse {
 			rr.RespondedTo = true
 			rr.Response = resp.response
@@ -987,7 +999,7 @@ func (x atomix) GetRequest(correlID string) (any, error) {
 	if !ok {
 		return nil, ErrUnableToLoadExchange
 	}
-	r, found := xc.requests[correlID]
+	r, found := xc.requests.Load(correlID).(requestStruct)
 	if !found {
 		return nil, ErrNoSuchRequest
 	}
@@ -999,7 +1011,7 @@ func (x atomix) GetResponse(correlID string) (any, error) {
 	if !ok {
 		return nil, ErrUnableToLoadExchange
 	}
-	r, found := xc.responses[correlID]
+	r, found := xc.responses.Load(correlID).(responseStruct)
 	if !found {
 		return nil, ErrNoSuchResponse
 	}
@@ -1011,7 +1023,7 @@ func (x atomix) GetRequestAge(correlID string) (time.Duration, error) {
 	if !ok {
 		return -1, ErrUnableToLoadExchange
 	}
-	r, found := xc.requests[correlID]
+	r, found := xc.requests.Load(correlID).(requestStruct)
 	if !found {
 		return -1, ErrNoSuchRequest
 	}
