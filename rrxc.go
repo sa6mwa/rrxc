@@ -15,28 +15,45 @@ Example usages:
 
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	xc := controller.NewExchangeFromContext(ctx)
+	ctx = controller.NewExchangeContext(ctx)
+	xc, err := rrxc.ExchangeFromContext(ctx)
+	// handler error
 	defer xc.Close()
-	// Use ID in your outgoing message, the other side would have to include it in their response.
+	// Use ID in your outgoing message, the other side would have to include it in
+	// their response.
 	id := xc.NewCorrelID()
-	if err := xc.RegisterRequest(id, "hello world"); err != nil {
+	reg := &rrxc.Registration{
+		CorrelID: id,
+		Message: "hello world",
+	}
+	if err := xc.RegisterRequest(reg); err != nil {
 		return err
 	}
-	producer.Publish(queue, "hello world")
-	result, err := controller.Wait() // wait for RegisterResponse (in msghandler below)
+	producer.Publish(queue, fmt.Sprintf(`{"id":%q,"message":%q}`, reg.CorrelID, reg.Message.(string)))
+	result, err := rrxc.Wait(ctx) // wait for RegisterResponse (in msghandler below)
 	if err != nil {
 		return err
 	}
 
 	// In the message handler (consumer, in the same app as the http server)...
 
-	if controller.HasTag(correlatingID, "rollback") {
-		controller.Untag(correlatingID, "rollback")
+	if controller.HasTag(correlatingID, controller.GetRollbackTag()) {
 		// Silently ACK a rollback-message
 		return nil
 	}
 
-	if err := controller.RegisterResponse(correlatingID, "Hello there"); err != nil {
+	if err := controller.RegisterResponse(&rrxc.Registration{
+		CorrelID: correlatingID,
+		Message: "hello there",
+		FailOnDuplicate: true,
+	}); err != nil {
+		if errors.Is(err, rrxc.ErrHaveNoCorrelatedRequest) {
+			// Message was not for me, requeue it?
+			return err
+		} else if errors.Is(err, rrxc.ErrDuplicate) {
+			// Handle additional response with the same correlation ID
+			return nil
+		}
 		return err
 	}
 */
@@ -63,40 +80,154 @@ const (
 
 // A controller handles multiple exchanges.
 type Controller interface {
+	// Controller_SetRollbackTag sets the name of the rollback tag (by default "rollback")
+	// which a correlID is tagged with when a request in an exchange context is not
+	// responded to when the exchange is terminated by a cancelled context.
 	SetRollbackTag(tag string) Controller
+
+	// Controller_GetRollbackTag returns the configured rollback tag (default
+	// "rollback").
 	GetRollbackTag() string
+
+	// SetRollbacktagLifespan sets the timeout until the rollback tag is removed
+	// (default 3h). A value of 0 disables the timeout (not recommended).
 	SetRollbackTagLifespan(d time.Duration) Controller
+
+	// Controller.NewControllerContext stores the already initiated controller in
+	// ctx Values to be retrieved using rrxc.ControllerFromContext. Returns a
+	// derived context.
 	NewControllerContext(ctx context.Context) context.Context
+
+	// NewExchangeContext is usually executed inside a HTTP handler function or MQ
+	// message handler function.
+	//
+	//	ctx := controller.NewExchangeContext(context.Background())
 	NewExchangeContext(ctx context.Context) context.Context
+
+	// NewCorrelID returns a new correlation identifier to stamp on requests. The
+	// returned CorrelID is guaranteed not to conflict with another request in any
+	// of the controller's exchanges.
 	NewCorrelID() string
+
+	// HasRequest returns true if this controller has a request with given
+	// correlID or false if not.
 	HasRequest(correlID string) bool
+
+	// GetRequestAge returns age (time.Duration) of request or error if request
+	// with correlID does not exist.
 	GetRequestAge(correlID string) (time.Duration, error)
+
+	// RegisterResponse registers a response to a previous request based on
+	// correlation ID. Input is a rrxc.Registration struct where CorrelID,
+	// Message, OverwriteOnDuplicate and FailOnDuplicate are used. If you only
+	// fill in CorrelID and Message, function will return
+	// rrxc.ErrHaveNoCorrelatedRequest if there is no correlated request. If
+	// OverwriteOnDuplicate is set to true and FailOnDuplicate is false, function
+	// will silently return nil (without overwriting a previous response).
 	RegisterResponse(r *Registration) error
+
+	// Synchronize creates a new Exchange and configures a struct with Context,
+	// Controller and Exchange. The orchestration function will wait until all
+	// requests have been responded to or the context has timed out.
+	//
+	// Usage:
+	//
+	//	xcresult, err := controller.Synchronize(rrxc.ExchangeFromContext(context.WithTimeout(context.Background(), 15 * time.Second), func(sb SyncBundle) error {
+	//		sb.Exchange.RegisterRequest(...)
+	//	}))
 	Synchronize(ctx context.Context, operation func(sb SyncBundle) error) (ExchangeResult, error)
+
+	// Tag tags the entity with tag and - optionally - sends the entity value
+	// through the channel(s) specified in notificationChannels in a separate
+	// goroutine.
 	Tag(entity any, tag any, notificationChannels ...chan any)
+
+	// Untag removes tag from entity and - optionally - sends the entity value
+	// through the channel(s) specified in notificationChannels in a separate
+	// goroutine. Returns nil or the only error rrxc.ErrNoSuchEntity if entity was
+	// not previously tagged.
 	Untag(entity any, tag any, notificationChannels ...chan any) error
+
+	// If zero tags were given HasTag will consider that you want to know whether
+	// the entity is untagged or not. If it is tagged and zero tags were given,
+	// HasTag will return false.
 	HasTag(entity any, tags ...any) bool
+
+	// Close the controller (optional) and terminate all child exchanges.
 	Close()
 }
 
 // An exchange is a set of request/response pairs (or just one pair).
 type Exchange interface {
+	// Controller returns the controller attached to this exchange so that
+	// you can do controller operations even if you only access to an exchange
+	// context. Can not be used as a chained method as it returns error if the
+	// exchange could not be retrieved.
 	Controller() (Controller, error)
+
+	// GetID returns the *ExchangeID* of this exchange (not to be confused with
+	// CorrelID).
 	GetID() string
+
+	// NewCorrelID returns a new correlation identifier to stamp on requests. The
+	// returned CorrelID is guaranteed not to conflict with another request in any
+	// of the parent controller's other exchanges.
 	NewCorrelID() string
+
+	// HasCorrelID returns true if this exchange has correlID as an identifier of a
+	// request/response. Returns false if not.
 	HasCorrelID(correlID string) bool
-	HasRequest(correlID string) bool
-	GetRequestAge(correlID string) (time.Duration, error)
+
+	// RegisterRequest registers an outgoing request in the controller
+	// (before you send the actual request). RegisterRequest takes a Registration
+	// struct where CorrelID, Message and NotifyOnResponse are the only relevant
+	// fields. Function only returns rrxc.ErrUnableToLoadExchange on error.
+	//
+	// notificationChannelsOnResponse are synchronous, if one in the list blocks on
+	// send, the rest will wait to be notified. TODO: Not sure which behaviour is
+	// more favourable: asynchronous or synchronous. It's easy to make
+	// asynchronous, each channel could have it's own goroutine. Behaviour could be
+	// configurable in the new-constructor.
 	RegisterRequest(r *Registration) error
+
+	// RegisterResponse registers a response to a previous request based on
+	// correlation ID. Input is a rrxc.Registration struct where CorrelID, Message,
+	// OverwriteOnDuplicate and FailOnDuplicate are used. If you only fill in
+	// CorrelID and Message, function will return rrxc.ErrHaveNoCorrelatedRequest if
+	// there is no correlated request. If OverwriteOnDuplicate is set to true and
+	// FailOnDuplicate is false, function will silently return nil (without
+	// overwriting a previous response).
 	RegisterResponse(r *Registration) error
+
+	// HasRequest returns true if a request in this exchange exists with specified
+	// correlID.
+	HasRequest(correlID string) bool
+
+	// GetExchangeResult returns an ExchangeResult struct. It is recommended to
+	// call this function after confirming the Exchange has ended.
 	GetExchangeResult() ExchangeResult
+
+	// GetRequestsAndResponses returns a slice with all RequestResponse objects in
+	// this exchange.
 	GetRequestsAndResponses() []RequestResponse
+
+	// GetRequest returns the message data in request with correlID or error
+	// (ErrUnableToLoadExchange or ErrNoSuchRequest).
 	GetRequest(correlID string) (any, error)
+
+	// GetResponse returns the message data in response with correlID or error
+	// (ErrUnableToLoadExchange or ErrNoSuchResponse).
 	GetResponse(correlID string) (any, error)
+
+	// GetRequestAge returns age (time.Duration) of request (in this exchange) or
+	// error if request with correlID does not exist.
+	GetRequestAge(correlID string) (time.Duration, error)
 
 	// Done returns a receive-only channel which is closed when all requests in
 	// the exchange have been responded to. It will also close
 	Done() <-chan struct{}
+
+	// Close exchange.
 	Close()
 }
 
@@ -215,7 +346,7 @@ var (
 	ErrNoExchangeInContext  error = errors.New("context has no request/response exchange")
 	ErrUnableToLoadExchange error = errors.New("unable to load exchange, key not found")
 	ErrCorrelIDConflict     error = errors.New("correlation identifier conflict: already have a request with that correlID")
-	//ErrNoTagsGiven             error = errors.New("no tags given, must at least provide one")
+	//ErrNoTagsGiven             error = errors.New("no tags given")
 	ErrNoSuchEntity            error = errors.New("no such entity")
 	ErrHaveNoCorrelatedRequest error = errors.New("request/response correlation failure: no request found to associate response with")
 	ErrNoSuchRequest           error = errors.New("no such request")
@@ -248,6 +379,8 @@ func NewControllerContext(ctx context.Context) context.Context {
 	return context.WithValue(ctx, controllerKey{}, NewController())
 }
 
+// ControllerFromContext returns the Controller stored (by NewControllerContext)
+// in ctx or error rrxc.ErrNoControllerContext.
 func ControllerFromContext(ctx context.Context) (Controller, error) {
 	ctrlr, ok := ctx.Value(controllerKey{}).(*controller)
 	if !ok {
@@ -256,6 +389,8 @@ func ControllerFromContext(ctx context.Context) (Controller, error) {
 	return ctrlr, nil
 }
 
+// ExchangeFromContext returns the Exchange stored (by NewExchangeContext) in
+// ctx or error rrxc.ErrNoExchangeInContext.
 func ExchangeFromContext(ctx context.Context) (Exchange, error) {
 	x, ok := ctx.Value(exchangeKey{}).(atomix)
 	if !ok {
@@ -264,6 +399,10 @@ func ExchangeFromContext(ctx context.Context) (Exchange, error) {
 	return x, nil
 }
 
+// RegisterRequestByContext registers an outgoing request in the Exchange
+// context stored in ctx. RegisterRequest takes a Registration struct where
+// CorrelID, Message and NotifyOnResponse are the only relevant fields. Function
+// only returns rrxc.ErrUnableToLoadExchange on error.
 func RegisterRequestByContext(ctx context.Context, r *Registration) error {
 	xc, ok := ctx.Value(exchangeKey{}).(atomix)
 	if !ok {
@@ -272,6 +411,13 @@ func RegisterRequestByContext(ctx context.Context, r *Registration) error {
 	return xc.RegisterRequest(r)
 }
 
+// RegisterResponseByContext registers a response to a previous request in the
+// Exchange context ctx based on correlation ID. Input is a rrxc.Registration
+// struct where CorrelID, Message, OverwriteOnDuplicate and FailOnDuplicate are
+// used. If you only fill in CorrelID and Message, function will return
+// rrxc.ErrHaveNoCorrelatedRequest if there is no correlated request. If
+// OverwriteOnDuplicate is set to true and FailOnDuplicate is false, function
+// will silently return nil (without overwriting a previous response).
 func RegisterResponseByContext(ctx context.Context, r *Registration) error {
 	xc, ok := ctx.Value(exchangeKey{}).(atomix)
 	if !ok {
@@ -280,6 +426,9 @@ func RegisterResponseByContext(ctx context.Context, r *Registration) error {
 	return xc.RegisterResponse(r)
 }
 
+// Wait is a synchronization primitive simply waiting until the Exchange context
+// ctx is finished (i.e all requests have been responded to) or the context has
+// been cancelled (e.g timed out). Returns an ExchangeResult object or error.
 func Wait(ctx context.Context) (ExchangeResult, error) {
 	xc, err := ExchangeFromContext(ctx)
 	if err != nil {
@@ -293,6 +442,8 @@ func Wait(ctx context.Context) (ExchangeResult, error) {
 	return xc.GetExchangeResult(), nil
 }
 
+// CloseExchangeByContext closes an exchange by it's context ctx. Returns
+// ErrNoExchangeInContext in case of error.
 func CloseExchangeByContext(ctx context.Context) error {
 	xc, ok := ctx.Value(exchangeKey{}).(atomix)
 	if !ok {
@@ -361,38 +512,24 @@ func (c *controller) GetExchangeByCorrelID(correlID string) (Exchange, error) {
 	return nil, ErrHaveNoCorrelatedRequest
 }
 
-// Controller_SetRollbackTag sets the name of the rollback tag (by default "rollback")
-// which a correlID is tagged with when a request in an exchange context is not
-// responded to when the exchange is terminated by a cancelled context.
 func (c *controller) SetRollbackTag(tag string) Controller {
 	c.rollbackTag.Store(tag)
 	return c
 }
 
-// Controller_GetRollbackTag returns the configured rollback tag (default
-// "rollback").
 func (c *controller) GetRollbackTag() string {
 	return c.rollbackTag.Load().(string)
 }
 
-// SetRollbacktagLifespan sets the timeout until the rollback tag is removed
-// (default 3h). A value of 0 disables the timeout (not recommended).
 func (c *controller) SetRollbackTagLifespan(d time.Duration) Controller {
 	c.rollbackTagLifespan.Store(d)
 	return c
 }
 
-// Controller.NewControllerContext stores the already initiated controller in
-// ctx Values to be retrieved using rrxc.ControllerFromContext. Returns a
-// derived context.
 func (c *controller) NewControllerContext(ctx context.Context) context.Context {
 	return context.WithValue(ctx, controllerKey{}, c)
 }
 
-// NewExchangeContext is usually executed inside a HTTP handler function or MQ
-// message handler function.
-//
-//	ctx := NewExchangeContext(context.Background())
 func (c *controller) NewExchangeContext(ctx context.Context) context.Context {
 	xc := exchange{
 		controller: c,
@@ -509,8 +646,6 @@ func (c *controller) HasRequest(correlID string) bool {
 	return false
 }
 
-// Returns age of request and true if requests or false if request does no
-// exist.
 func (c *controller) GetRequestAge(correlID string) (time.Duration, error) {
 	for _, exchangeID := range c.contexts.Keys() {
 		ctx, ok := c.contexts.Load(exchangeID).(context.Context)
@@ -566,12 +701,6 @@ func (c *controller) RegisterResponse(r *Registration) error {
 // 	return xc.RegisterResponse(r)
 // }
 
-// Usage:
-//
-//	ctrl := rrxc.NewController()
-//	xcresult, err := ctrl.Synchronize(rrxc.ExchangeFromContext(context.WithTimeout(context.Background(), 15 * time.Second), func(sb SyncBundle) error {
-//		sb.Exchange.RegisterRequest(...)
-//	}))
 func (c *controller) Synchronize(ctx context.Context, operation func(sb SyncBundle) error) (ExchangeResult, error) {
 	xc, err := ExchangeFromContext(ctx)
 	if err != nil {
@@ -607,9 +736,6 @@ func (c *controller) Synchronize(ctx context.Context, operation func(sb SyncBund
 // 	return xc.GetExchangeResult(), nil
 // }
 
-// Tag tags the entity with tag and - optionally - sends the entity value
-// through the channel(s) specified in notificationChannels in a separate
-// goroutine.
 func (c *controller) Tag(entity any, tag any, notificationChannels ...chan any) {
 	c.mapOfMaps.Run(func(mm anystore.AnyStore) error {
 		kv := make(tagMap)
@@ -627,10 +753,6 @@ func (c *controller) Tag(entity any, tag any, notificationChannels ...chan any) 
 	}
 }
 
-// Untag removes tag from entity and - optionally - sends the entity value
-// through the channel(s) specified in notificationChannels in a separate
-// goroutine. Returns nil or the only error rrxc.ErrNoSuchEntity if entity was
-// not previously tagged.
 func (c *controller) Untag(entity any, tag any, notificationChannels ...chan any) error {
 	err := c.mapOfMaps.Run(func(mm anystore.AnyStore) error {
 		entityTagMap, ok := c.mapOfMaps.Load(entity).(tagMap)
@@ -661,9 +783,6 @@ func (c *controller) Untag(entity any, tag any, notificationChannels ...chan any
 	return nil
 }
 
-// If zero tags were given HasTag will consider that you want to know whether
-// the entity is untagged or not. If it is tagged and zero tags were given,
-// HasTag will return false.
 func (c *controller) HasTag(entity any, tags ...any) bool {
 	m, ok := c.mapOfMaps.Load(entity).(tagMap)
 	if !ok {
@@ -696,10 +815,6 @@ func (c *controller) Close() {
 //
 // Receiver functions attached to atomix implement the Exchange interface.
 
-// Exchange_Controller returns the controller attached to this exchange so that
-// you can do controller operations even if you only access to an exchange
-// context. Can not be used as a chained method as it returns error if the
-// exchange could not be retrieved.
 func (x atomix) Controller() (Controller, error) {
 	xc, ok := x.Load(exchangeKey{}).(exchange)
 	if !ok {
@@ -726,8 +841,6 @@ func (x atomix) NewCorrelID() string {
 	return xc.controller.NewCorrelID()
 }
 
-// HasCorrelID returns true if this exchange has correlID as an identifier of a
-// request/response. Returns false if not.
 func (x atomix) HasCorrelID(correlID string) bool {
 	xc, ok := x.Load(exchangeKey{}).(exchange)
 	if !ok {
@@ -737,16 +850,6 @@ func (x atomix) HasCorrelID(correlID string) bool {
 	return exist
 }
 
-// Exchange_RegisterRequest registers an outgoing request in the controller
-// (before you send the actual request). RegisterRequest takes a Registration
-// struct where CorrelID, Message and NotifyOnResponse are the only relevant
-// fields. Function only returns rrxc.ErrUnableToLoadExchange on error.
-//
-// notificationChannelsOnResponse are synchronous, if one in the list blocks on
-// send, the rest will wait to be notified. TODO: Not sure which behaviour is
-// more favourable: asynchronous or synchronous. It's easy to make
-// asynchronous, each channel could have it's own goroutine. Behaviour could be
-// configurable in the new-constructor.
 func (x atomix) RegisterRequest(r *Registration) error {
 	return x.Run(func(a anystore.AnyStore) error {
 		xc, ok := a.Load(exchangeKey{}).(exchange)
@@ -764,13 +867,6 @@ func (x atomix) RegisterRequest(r *Registration) error {
 	})
 }
 
-// Exchange_RegisterResponse registers a response to a previous request based on
-// crorrelation ID. Input is a rrxc.Registration struct where CorrelID, Message,
-// OverwriteOnDuplicate and FailOnDuplicate are used. If you only fill in
-// CorrelID and Message, function will return rrxc.ErrHaveNoCorrelatedRequest if
-// there is no correlated request. If OverwriteOnDuplicate is set to true and
-// FailOnDuplicate is false, function will silently return nil (without
-// overwriting a previous response).
 func (x atomix) RegisterResponse(r *Registration) error {
 	return x.Run(func(a anystore.AnyStore) error {
 		xc, ok := a.Load(exchangeKey{}).(exchange)
