@@ -140,7 +140,9 @@ rrxc.RegisterRequestByContext(ca,...)  rrxc.RegisterRequestByContext(cb,...)
 
 ## Bugs
 
-The following appeared during load testing...
+The following appeared during load testing (fixed in
+8ea22054224122f3f887404b2aca9428cb2e5dce). Cause was using a map incorrectly,
+resolved by implementing `anystore.AnyStore` for the map instead.
 
 ```
 fatal error: concurrent map read and map write
