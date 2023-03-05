@@ -71,11 +71,8 @@ type Controller interface {
 	NewCorrelID() string
 	HasRequest(correlID string) bool
 	GetRequestAge(correlID string) (time.Duration, error)
-	RegisterResponse(correlID string, response any, dropDuplicates ...bool) error
-	RegisterRequestByContext(ctx context.Context, correlID string, request any, notificationChannelsOnResponse ...chan RequestResponse) error
-	RegisterResponseByContext(ctx context.Context, correlID string, response any, dropDuplicates ...bool) error
+	RegisterResponse(r *Registration) error
 	Synchronize(ctx context.Context, operation func(sb SyncBundle) error) (ExchangeResult, error)
-	Wait(ctx context.Context) (ExchangeResult, error)
 	Tag(entity any, tag any, notificationChannels ...chan any)
 	Untag(entity any, tag any, notificationChannels ...chan any) error
 	HasTag(entity any, tags ...any) bool
@@ -90,8 +87,8 @@ type Exchange interface {
 	HasCorrelID(correlID string) bool
 	HasRequest(correlID string) bool
 	GetRequestAge(correlID string) (time.Duration, error)
-	RegisterRequest(correlID string, request any, notificationChannelsOnResponse ...chan RequestResponse) error
-	RegisterResponse(correlID string, response any, dropDuplicates ...bool) error
+	RegisterRequest(r *Registration) error
+	RegisterResponse(r *Registration) error
 	GetExchangeResult() ExchangeResult
 	GetRequestsAndResponses() []RequestResponse
 	GetRequest(correlID string) (any, error)
@@ -134,6 +131,14 @@ type RequestResponse struct {
 	RequestRegistered  time.Time
 	ResponseRegistered time.Time
 	Latency            time.Duration
+}
+
+type Registration struct {
+	CorrelID             string
+	Message              any
+	NotifyOnResponse     []chan RequestResponse
+	OverwriteOnDuplicate bool
+	FailOnDuplicate      bool
 }
 
 // Key used to store and load the controller interface from the AnyStore in the
@@ -259,20 +264,20 @@ func ExchangeFromContext(ctx context.Context) (Exchange, error) {
 	return x, nil
 }
 
-func RegisterRequestByContext(ctx context.Context, correlID string, request any, notificationChannelsOnResponse ...chan RequestResponse) error {
+func RegisterRequestByContext(ctx context.Context, r *Registration) error {
 	xc, ok := ctx.Value(exchangeKey{}).(atomix)
 	if !ok {
 		return ErrNoExchangeInContext
 	}
-	return xc.RegisterRequest(correlID, request, notificationChannelsOnResponse...)
+	return xc.RegisterRequest(r)
 }
 
-func RegisterResponseByContext(ctx context.Context, correlID string, response any, dropDuplicates ...bool) error {
+func RegisterResponseByContext(ctx context.Context, r *Registration) error {
 	xc, ok := ctx.Value(exchangeKey{}).(atomix)
 	if !ok {
 		return ErrNoExchangeInContext
 	}
-	return xc.RegisterResponse(correlID, response, dropDuplicates...)
+	return xc.RegisterResponse(r)
 }
 
 func Wait(ctx context.Context) (ExchangeResult, error) {
@@ -526,7 +531,7 @@ func (c *controller) GetRequestAge(correlID string) (time.Duration, error) {
 	return -1, ErrNoSuchRequest
 }
 
-func (c *controller) RegisterResponse(correlID string, response any, dropDuplicates ...bool) error {
+func (c *controller) RegisterResponse(r *Registration) error {
 	for _, exchangeID := range c.contexts.Keys() {
 		ctx, ok := c.contexts.Load(exchangeID).(context.Context)
 		if !ok {
@@ -536,28 +541,30 @@ func (c *controller) RegisterResponse(correlID string, response any, dropDuplica
 		if err != nil {
 			continue
 		}
-		if xc.HasRequest(correlID) {
-			return xc.RegisterResponse(correlID, response, dropDuplicates...)
+		if xc.HasRequest(r.CorrelID) {
+			return xc.RegisterResponse(r)
 		}
 	}
 	return ErrHaveNoCorrelatedRequest
 }
 
-func (c *controller) RegisterRequestByContext(ctx context.Context, correlID string, request any, notificationChannelsOnResponse ...chan RequestResponse) error {
-	xc, ok := ctx.Value(exchangeKey{}).(atomix)
-	if !ok {
-		return ErrNoExchangeInContext
-	}
-	return xc.RegisterRequest(correlID, request, notificationChannelsOnResponse...)
-}
+// // Moved to pkg level
+// func (c *controller) RegisterRequestByContext(ctx context.Context, r *Registration) error {
+// 	xc, ok := ctx.Value(exchangeKey{}).(atomix)
+// 	if !ok {
+// 		return ErrNoExchangeInContext
+// 	}
+// 	return xc.RegisterRequest(r)
+// }
 
-func (c *controller) RegisterResponseByContext(ctx context.Context, correlID string, response any, dropDuplicates ...bool) error {
-	xc, ok := ctx.Value(exchangeKey{}).(atomix)
-	if !ok {
-		return ErrNoExchangeInContext
-	}
-	return xc.RegisterResponse(correlID, response, dropDuplicates...)
-}
+// // Moved to pkg level
+// func (c *controller) RegisterResponseByContext(ctx context.Context, r *Registration) error {
+// 	xc, ok := ctx.Value(exchangeKey{}).(atomix)
+// 	if !ok {
+// 		return ErrNoExchangeInContext
+// 	}
+// 	return xc.RegisterResponse(r)
+// }
 
 // Usage:
 //
@@ -586,18 +593,19 @@ func (c *controller) Synchronize(ctx context.Context, operation func(sb SyncBund
 	return xc.GetExchangeResult(), nil
 }
 
-func (c *controller) Wait(ctx context.Context) (ExchangeResult, error) {
-	xc, err := ExchangeFromContext(ctx)
-	if err != nil {
-		return ExchangeResult{}, err
-	}
-	defer xc.Close()
-	select {
-	case <-ctx.Done():
-	case <-xc.Done():
-	}
-	return xc.GetExchangeResult(), nil
-}
+// // Moved to pkg level
+// func (c *controller) Wait(ctx context.Context) (ExchangeResult, error) {
+// 	xc, err := ExchangeFromContext(ctx)
+// 	if err != nil {
+// 		return ExchangeResult{}, err
+// 	}
+// 	defer xc.Close()
+// 	select {
+// 	case <-ctx.Done():
+// 	case <-xc.Done():
+// 	}
+// 	return xc.GetExchangeResult(), nil
+// }
 
 // Tag tags the entity with tag and - optionally - sends the entity value
 // through the channel(s) specified in notificationChannels in a separate
@@ -621,7 +629,8 @@ func (c *controller) Tag(entity any, tag any, notificationChannels ...chan any) 
 
 // Untag removes tag from entity and - optionally - sends the entity value
 // through the channel(s) specified in notificationChannels in a separate
-// goroutine. Returns rrxc.ErrNoSuchEntity if entity was not previously tagged.
+// goroutine. Returns nil or the only error rrxc.ErrNoSuchEntity if entity was
+// not previously tagged.
 func (c *controller) Untag(entity any, tag any, notificationChannels ...chan any) error {
 	err := c.mapOfMaps.Run(func(mm anystore.AnyStore) error {
 		entityTagMap, ok := c.mapOfMaps.Load(entity).(tagMap)
@@ -728,21 +737,26 @@ func (x atomix) HasCorrelID(correlID string) bool {
 	return exist
 }
 
+// Exchange_RegisterRequest registers an outgoing request in the controller
+// (before you send the actual request). RegisterRequest takes a Registration
+// struct where CorrelID, Message and NotifyOnResponse are the only relevant
+// fields. Function only returns rrxc.ErrUnableToLoadExchange on error.
+//
 // notificationChannelsOnResponse are synchronous, if one in the list blocks on
 // send, the rest will wait to be notified. TODO: Not sure which behaviour is
 // more favourable: asynchronous or synchronous. It's easy to make
 // asynchronous, each channel could have it's own goroutine. Behaviour could be
 // configurable in the new-constructor.
-func (x atomix) RegisterRequest(correlID string, request any, notificationChannelsOnResponse ...chan RequestResponse) error {
+func (x atomix) RegisterRequest(r *Registration) error {
 	return x.Run(func(a anystore.AnyStore) error {
 		xc, ok := a.Load(exchangeKey{}).(exchange)
 		if !ok {
 			return ErrUnableToLoadExchange
 		}
-		xc.requests[correlID] = requestStruct{ // requestStruct should not be a pointer
-			request:                        request,
+		xc.requests[r.CorrelID] = requestStruct{ // requestStruct should not be a pointer
+			request:                        r.Message,
 			registered:                     time.Now(),
-			notificationChannelsOnResponse: notificationChannelsOnResponse,
+			notificationChannelsOnResponse: r.NotifyOnResponse,
 		}
 		// Commit changes
 		a.Store(exchangeKey{}, xc)
@@ -750,24 +764,34 @@ func (x atomix) RegisterRequest(correlID string, request any, notificationChanne
 	})
 }
 
-func (x atomix) RegisterResponse(correlID string, response any, dropDuplicates ...bool) error {
+// Exchange_RegisterResponse registers a response to a previous request based on
+// crorrelation ID. Input is a rrxc.Registration struct where CorrelID, Message,
+// OverwriteOnDuplicate and FailOnDuplicate are used. If you only fill in
+// CorrelID and Message, function will return rrxc.ErrHaveNoCorrelatedRequest if
+// there is no correlated request. If OverwriteOnDuplicate is set to true and
+// FailOnDuplicate is false, function will silently return nil (without
+// overwriting a previous response).
+func (x atomix) RegisterResponse(r *Registration) error {
 	return x.Run(func(a anystore.AnyStore) error {
 		xc, ok := a.Load(exchangeKey{}).(exchange)
 		if !ok {
 			return ErrUnableToLoadExchange
 		}
-		request, exist := xc.requests[correlID]
+		request, exist := xc.requests[r.CorrelID]
 		if !exist {
 			return ErrHaveNoCorrelatedRequest
 		}
-		if _, exist := xc.responses[correlID]; exist && len(dropDuplicates) > 0 && dropDuplicates[0] {
-			return ErrDuplicate
+		if _, exist := xc.responses[r.CorrelID]; exist && !r.OverwriteOnDuplicate {
+			if r.FailOnDuplicate {
+				return ErrDuplicate
+			}
+			return nil
 		}
 		request.completed = true
-		xc.requests[correlID] = request
+		xc.requests[r.CorrelID] = request
 		timeRegistered := time.Now()
-		xc.responses[correlID] = responseStruct{
-			response:   response,
+		xc.responses[r.CorrelID] = responseStruct{
+			response:   r.Message,
 			registered: timeRegistered,
 		}
 		// If all requests have been responded to, we are done, you can not add
@@ -792,9 +816,9 @@ func (x atomix) RegisterResponse(correlID string, response any, dropDuplicates .
 			go func() {
 				for _, ch := range request.notificationChannelsOnResponse {
 					ch <- RequestResponse{
-						CorrelID:           correlID,
+						CorrelID:           r.CorrelID,
 						Request:            request.request,
-						Response:           response,
+						Response:           r.Message,
 						RespondedTo:        true,
 						RequestRegistered:  request.registered,
 						ResponseRegistered: timeRegistered,

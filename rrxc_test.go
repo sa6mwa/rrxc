@@ -49,12 +49,19 @@ func TestExchangeFromContext(t *testing.T) {
 
 	id := xc.NewCorrelID()
 
-	if err := xc.RegisterRequest(id, "hello world", ch); err != nil {
+	if err := xc.RegisterRequest(&rrxc.Registration{
+		CorrelID:         id,
+		Message:          "hello world",
+		NotifyOnResponse: []chan rrxc.RequestResponse{ch},
+	}); err != nil {
 		log.Fatal(err)
 	}
 	//time.Sleep(100 * time.Millisecond)
 
-	if err := xc.RegisterResponse(id, "yes, hello there"); err != nil {
+	if err := xc.RegisterResponse(&rrxc.Registration{
+		CorrelID: id,
+		Message:  "yes, hello there",
+	}); err != nil {
 		log.Fatal(err)
 	}
 
@@ -78,7 +85,10 @@ func TestController_Synchronize(t *testing.T) {
 		}
 		for i := 0; i < 100; i++ {
 			id := fmt.Sprintf("abc%d", i)
-			if err := controller.RegisterResponse(id, "Hi there, "+id); err != nil {
+			if err := controller.RegisterResponse(&rrxc.Registration{
+				CorrelID: id,
+				Message:  "Hi there, " + id,
+			}); err != nil {
 				t.Log(err)
 			}
 		}
@@ -89,7 +99,10 @@ func TestController_Synchronize(t *testing.T) {
 			id := fmt.Sprintf("abc%d", i)
 			//id := sb.Exchange.NewCorrelID()
 
-			if err := sb.Exchange.RegisterRequest(id, "hello world"); err != nil {
+			if err := sb.Exchange.RegisterRequest(&rrxc.Registration{
+				CorrelID: id,
+				Message:  "hello world",
+			}); err != nil {
 				t.Fatal(err)
 			}
 
@@ -129,7 +142,10 @@ func TestController_Wait(t *testing.T) {
 		}
 		for i := 0; i < 99; i++ {
 			id := fmt.Sprintf("abc%d", i)
-			if err := controller.RegisterResponse(id, "Hello there, "+id); err != nil {
+			if err := controller.RegisterResponse(&rrxc.Registration{
+				CorrelID: id,
+				Message:  "Hello there, " + id,
+			}); err != nil {
 				t.Log(err)
 			}
 		}
@@ -146,13 +162,16 @@ func TestController_Wait(t *testing.T) {
 		id := fmt.Sprintf("abc%d", i)
 		//id := xc.NewCorrelID()
 		//if err := xc.RegisterRequest(id, "hello world"); err != nil {
-		if err := c.RegisterRequestByContext(ctx, id, "hello world"); err != nil {
+		if err := rrxc.RegisterRequestByContext(ctx, &rrxc.Registration{
+			CorrelID: id,
+			Message:  "hello world",
+		}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	close(ready)
 
-	xcresult, err := c.Wait(ctx)
+	xcresult, err := rrxc.Wait(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +243,10 @@ func TestController_NewCorrelID(t *testing.T) {
 			t.Fatal(err)
 		}
 		for ii := 0; ii < requestsPerExchange; ii++ {
-			if err := xc.RegisterRequest(xc.NewCorrelID(), "hello world"); err != nil {
+			if err := xc.RegisterRequest(&rrxc.Registration{
+				CorrelID: xc.NewCorrelID(),
+				Message:  "hello world",
+			}); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -260,7 +282,10 @@ func TestExchange_NewCorrelID(t *testing.T) {
 			t.Fatal(err)
 		}
 		for ii := 0; ii < requestsPerExchange; ii++ {
-			if err := xc.RegisterRequest(xc.NewCorrelID(), "hello world"); err != nil {
+			if err := xc.RegisterRequest(&rrxc.Registration{
+				CorrelID: xc.NewCorrelID(),
+				Message:  "hello world",
+			}); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -296,7 +321,10 @@ func TestController_HasRequest(t *testing.T) {
 		cids[cid] = true
 	}
 	for cid, _ := range cids {
-		if err := controller.RegisterRequestByContext(ctx, cid, "hello world"); err != nil {
+		if err := rrxc.RegisterRequestByContext(ctx, &rrxc.Registration{
+			CorrelID: cid,
+			Message:  "hello world",
+		}); err != nil {
 			t.Error(err)
 		}
 	}
@@ -321,7 +349,10 @@ func TestController_GetRequestAge(t *testing.T) {
 		cids[cid] = true
 	}
 	for cid, _ := range cids {
-		if err := controller.RegisterRequestByContext(ctx, cid, "hello world"); err != nil {
+		if err := rrxc.RegisterRequestByContext(ctx, &rrxc.Registration{
+			CorrelID: cid,
+			Message:  "hello world",
+		}); err != nil {
 			t.Error(err)
 		}
 	}
@@ -341,7 +372,10 @@ func FuzzController_RegisterResponse(f *testing.F) {
 	controller := rrxc.NewController()
 	ctx := controller.NewExchangeContext(context.Background())
 
-	if err := controller.RegisterRequestByContext(ctx, "0123456789", "hello world"); err != nil {
+	if err := rrxc.RegisterRequestByContext(ctx, &rrxc.Registration{
+		CorrelID: "0123456789",
+		Message:  "hello world",
+	}); err != nil {
 		f.Fatal(err)
 	}
 
@@ -353,7 +387,10 @@ func FuzzController_RegisterResponse(f *testing.F) {
 		if err != nil {
 			t.Error(err)
 		}
-		if err := exchange.RegisterResponse(a, "this is my response"); err != nil {
+		if err := exchange.RegisterResponse(&rrxc.Registration{
+			CorrelID: a,
+			Message:  "this is my response",
+		}); err != nil {
 			switch {
 			case errors.Is(err, rrxc.ErrNoSuchRequest), errors.Is(err, rrxc.ErrHaveNoCorrelatedRequest):
 			default:
