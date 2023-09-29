@@ -320,7 +320,7 @@ func TestController_HasRequest(t *testing.T) {
 		}
 		cids[cid] = true
 	}
-	for cid, _ := range cids {
+	for cid := range cids {
 		if err := rrxc.RegisterRequestByContext(ctx, &rrxc.Registration{
 			CorrelID: cid,
 			Message:  "hello world",
@@ -328,7 +328,7 @@ func TestController_HasRequest(t *testing.T) {
 			t.Error(err)
 		}
 	}
-	for cid, _ := range cids {
+	for cid := range cids {
 		if !controller.HasRequest(cid) {
 			t.Errorf("request with correlID %q does not exist in exchange", cid)
 		}
@@ -348,7 +348,7 @@ func TestController_GetRequestAge(t *testing.T) {
 		}
 		cids[cid] = true
 	}
-	for cid, _ := range cids {
+	for cid := range cids {
 		if err := rrxc.RegisterRequestByContext(ctx, &rrxc.Registration{
 			CorrelID: cid,
 			Message:  "hello world",
@@ -357,7 +357,7 @@ func TestController_GetRequestAge(t *testing.T) {
 		}
 	}
 	time.Sleep(pauseDuration)
-	for cid, _ := range cids {
+	for cid := range cids {
 		d, err := controller.GetRequestAge(cid)
 		if err != nil {
 			t.Fatal(err)

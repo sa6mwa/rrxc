@@ -60,17 +60,18 @@ Example usages:
 package rrxc
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log"
 	"sync/atomic"
 	"time"
 
 	"github.com/sa6mwa/rrxc/pkg/anystore"
-	"golang.org/x/net/context"
 )
 
 const (
@@ -224,7 +225,7 @@ type Exchange interface {
 	GetRequestAge(correlID string) (time.Duration, error)
 
 	// Done returns a receive-only channel which is closed when all requests in
-	// the exchange have been responded to. It will also close
+	// the exchange have been responded to.
 	Done() <-chan struct{}
 
 	// Close exchange.
@@ -361,8 +362,8 @@ var (
 // in HandleFuncs and message handlers.
 func NewController() Controller {
 	ctrlr := &controller{
-		contexts:  anystore.NewAnyStore(),
-		mapOfMaps: anystore.NewAnyStore(),
+		contexts:  anystore.New(),
+		mapOfMaps: anystore.New(),
 		done:      make(chan struct{}),
 	}
 	ctrlr.rollbackTag.Store(defaultRollbackTag)
@@ -496,8 +497,16 @@ func NewID512() string {
 // Controller interface
 
 func (c *controller) GetExchangeByCorrelID(correlID string) (Exchange, error) {
-	for _, exchangeID := range c.contexts.Keys() {
-		ctx, ok := c.contexts.Load(exchangeID).(context.Context)
+	keys, err := c.contexts.Keys()
+	if err != nil {
+		return nil, err
+	}
+	for _, exchangeID := range keys {
+		val, err := c.contexts.Load(exchangeID)
+		if err != nil {
+			return nil, err
+		}
+		ctx, ok := val.(context.Context)
 		if !ok {
 			continue
 		}
@@ -535,13 +544,13 @@ func (c *controller) NewExchangeContext(ctx context.Context) context.Context {
 		controller: c,
 		id:         NewID(),
 		created:    time.Now(),
-		requests:   anystore.NewAnyStore(),
-		responses:  anystore.NewAnyStore(),
+		requests:   anystore.New(),
+		responses:  anystore.New(),
 		finalize:   make(chan struct{}),
 		done:       make(chan struct{}),
 	}
 	axc := atomix{
-		anystore.NewAnyStore(),
+		anystore.New(),
 	}
 	axc.Store(exchangeKey{}, xc)
 	newContext := context.WithValue(ctx, exchangeKey{}, axc)
@@ -559,11 +568,23 @@ func (c *controller) NewExchangeContext(ctx context.Context) context.Context {
 		c.contexts.Delete(xc.id)
 		if axc.HasKey(exchangeKey{}) {
 			axc.Run(func(a anystore.AnyStore) error {
-				grxc, ok := a.Load(exchangeKey{}).(exchange)
+				val, err := a.Load(exchangeKey{})
+				if err != nil {
+					return err
+				}
+				grxc, ok := val.(exchange)
 				if ok {
 					if tagForRollback {
-						for _, correlID := range grxc.requests.Keys() {
-							r, ok := grxc.requests.Load(correlID).(requestStruct)
+						keys, err := grxc.requests.Keys()
+						if err != nil {
+							return err
+						}
+						for _, correlID := range keys {
+							val, err := grxc.requests.Load(correlID)
+							if err != nil {
+								return err
+							}
+							r, ok := val.(requestStruct)
 							if !ok {
 								continue
 							}
@@ -610,8 +631,16 @@ func (c *controller) NewCorrelID() string {
 	correlID := NewID()
 	for {
 		hasCorrelID := false
-		for _, exchangeID := range c.contexts.Keys() {
-			ctx, ok := c.contexts.Load(exchangeID).(context.Context)
+		keys, err := c.contexts.Keys()
+		if err != nil {
+			return correlID
+		}
+		for _, exchangeID := range keys {
+			val, err := c.contexts.Load(exchangeID)
+			if err != nil {
+				return correlID
+			}
+			ctx, ok := val.(context.Context)
 			if !ok {
 				continue
 			}
@@ -633,8 +662,16 @@ func (c *controller) NewCorrelID() string {
 }
 
 func (c *controller) HasRequest(correlID string) bool {
-	for _, exchangeID := range c.contexts.Keys() {
-		ctx, ok := c.contexts.Load(exchangeID).(context.Context)
+	keys, err := c.contexts.Keys()
+	if err != nil {
+		return false
+	}
+	for _, exchangeID := range keys {
+		val, err := c.contexts.Load(exchangeID)
+		if err != nil {
+			continue
+		}
+		ctx, ok := val.(context.Context)
 		if !ok {
 			continue
 		}
@@ -651,8 +688,16 @@ func (c *controller) HasRequest(correlID string) bool {
 }
 
 func (c *controller) GetRequestAge(correlID string) (time.Duration, error) {
-	for _, exchangeID := range c.contexts.Keys() {
-		ctx, ok := c.contexts.Load(exchangeID).(context.Context)
+	keys, err := c.contexts.Keys()
+	if err != nil {
+		return -1, err
+	}
+	for _, exchangeID := range keys {
+		val, err := c.contexts.Load(exchangeID)
+		if err != nil {
+			continue
+		}
+		ctx, ok := val.(context.Context)
 		if !ok {
 			continue
 		}
@@ -671,8 +716,16 @@ func (c *controller) GetRequestAge(correlID string) (time.Duration, error) {
 }
 
 func (c *controller) RegisterResponse(r *Registration) error {
-	for _, exchangeID := range c.contexts.Keys() {
-		ctx, ok := c.contexts.Load(exchangeID).(context.Context)
+	keys, err := c.contexts.Keys()
+	if err != nil {
+		return err
+	}
+	for _, exchangeID := range keys {
+		val, err := c.contexts.Load(exchangeID)
+		if err != nil {
+			continue
+		}
+		ctx, ok := val.(context.Context)
 		if !ok {
 			continue
 		}
@@ -759,7 +812,11 @@ func (c *controller) Tag(entity any, tag any, notificationChannels ...chan any) 
 
 func (c *controller) Untag(entity any, tag any, notificationChannels ...chan any) error {
 	err := c.mapOfMaps.Run(func(mm anystore.AnyStore) error {
-		entityTagMap, ok := c.mapOfMaps.Load(entity).(tagMap)
+		val, err := c.mapOfMaps.Load(entity)
+		if err != nil {
+			return err
+		}
+		entityTagMap, ok := val.(tagMap)
 		if !ok {
 			return ErrNoSuchEntity
 		}
@@ -788,7 +845,11 @@ func (c *controller) Untag(entity any, tag any, notificationChannels ...chan any
 }
 
 func (c *controller) HasTag(entity any, tags ...any) bool {
-	m, ok := c.mapOfMaps.Load(entity).(tagMap)
+	val, err := c.mapOfMaps.Load(entity)
+	if err != nil {
+		return false
+	}
+	m, ok := val.(tagMap)
 	if !ok {
 		return false
 	}
@@ -820,7 +881,11 @@ func (c *controller) Close() {
 // Receiver functions attached to atomix implement the Exchange interface.
 
 func (x atomix) Controller() (Controller, error) {
-	xc, ok := x.Load(exchangeKey{}).(exchange)
+	val, err := x.Load(exchangeKey{})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrUnableToLoadExchange, err)
+	}
+	xc, ok := val.(exchange)
 	if !ok {
 		return nil, ErrUnableToLoadExchange
 	}
@@ -828,7 +893,11 @@ func (x atomix) Controller() (Controller, error) {
 }
 
 func (x atomix) GetID() string {
-	xc, ok := x.Load(exchangeKey{}).(exchange)
+	val, err := x.Load(exchangeKey{})
+	if err != nil {
+		return ""
+	}
+	xc, ok := val.(exchange)
 	if !ok {
 		return ""
 	}
@@ -836,7 +905,13 @@ func (x atomix) GetID() string {
 }
 
 func (x atomix) NewCorrelID() string {
-	xc, ok := x.Load(exchangeKey{}).(exchange)
+	val, err := x.Load(exchangeKey{})
+	if err != nil {
+		// Instead of panicking, just return a NewID, the risk that it already
+		// exists as an ID or CorrelID in this exchange is still extremely remote.
+		return NewID()
+	}
+	xc, ok := val.(exchange)
 	if !ok {
 		// Instead of panicking, just return a NewID, the risk that it already
 		// exists as an ID or CorrelID in this exchange is still extremely remote.
@@ -846,17 +921,29 @@ func (x atomix) NewCorrelID() string {
 }
 
 func (x atomix) HasCorrelID(correlID string) bool {
-	xc, ok := x.Load(exchangeKey{}).(exchange)
+	val, err := x.Load(exchangeKey{})
+	if err != nil {
+		return false
+	}
+	xc, ok := val.(exchange)
 	if !ok {
 		return false
 	}
-	_, exist := xc.requests.Load(correlID).(requestStruct)
+	val, err = xc.requests.Load(correlID)
+	if err != nil {
+		return false
+	}
+	_, exist := val.(requestStruct)
 	return exist
 }
 
 func (x atomix) RegisterRequest(r *Registration) error {
 	return x.Run(func(a anystore.AnyStore) error {
-		xc, ok := a.Load(exchangeKey{}).(exchange)
+		val, err := a.Load(exchangeKey{})
+		if err != nil {
+			return err
+		}
+		xc, ok := val.(exchange)
 		if !ok {
 			return ErrUnableToLoadExchange
 		}
@@ -866,22 +953,33 @@ func (x atomix) RegisterRequest(r *Registration) error {
 			notificationChannelsOnResponse: r.NotifyOnResponse,
 		})
 		// Commit changes
-		a.Store(exchangeKey{}, xc)
-		return nil
+		return a.Store(exchangeKey{}, xc)
 	})
 }
 
 func (x atomix) RegisterResponse(r *Registration) error {
 	return x.Run(func(a anystore.AnyStore) error {
-		xc, ok := a.Load(exchangeKey{}).(exchange)
+		val, err := a.Load(exchangeKey{})
+		if err != nil {
+			return err
+		}
+		xc, ok := val.(exchange)
 		if !ok {
 			return ErrUnableToLoadExchange
 		}
-		request, exist := xc.requests.Load(r.CorrelID).(requestStruct)
+		val, err = xc.requests.Load(r.CorrelID)
+		if err != nil {
+			return err
+		}
+		request, exist := val.(requestStruct)
 		if !exist {
 			return ErrHaveNoCorrelatedRequest
 		}
-		if _, exist := xc.responses.Load(r.CorrelID).(responseStruct); exist && !r.OverwriteOnDuplicate {
+		val, err = xc.responses.Load(r.CorrelID)
+		if err != nil {
+			return err
+		}
+		if _, exist := val.(responseStruct); exist && !r.OverwriteOnDuplicate {
 			if r.FailOnDuplicate {
 				return ErrDuplicate
 			}
@@ -897,8 +995,16 @@ func (x atomix) RegisterResponse(r *Registration) error {
 		// If all requests have been responded to, we are done, you can not add
 		// another request after the last response has finished.
 		closeExchange := true
-		for _, cid := range xc.requests.Keys() {
-			r, ok := xc.requests.Load(cid).(requestStruct)
+		keys, err := xc.requests.Keys()
+		if err != nil {
+			return err
+		}
+		for _, cid := range keys {
+			val, err := xc.requests.Load(cid)
+			if err != nil {
+				continue
+			}
+			r, ok := val.(requestStruct)
 			if !ok {
 				continue
 			}
@@ -937,16 +1043,28 @@ func (x atomix) RegisterResponse(r *Registration) error {
 }
 
 func (x atomix) HasRequest(correlID string) bool {
-	xc, ok := x.Load(exchangeKey{}).(exchange)
+	val, err := x.Load(exchangeKey{})
+	if err != nil {
+		return false
+	}
+	xc, ok := val.(exchange)
 	if !ok {
 		return false
 	}
-	_, exist := xc.requests.Load(correlID).(requestStruct)
+	val, err = xc.requests.Load(correlID)
+	if err != nil {
+		return false
+	}
+	_, exist := val.(requestStruct)
 	return exist
 }
 
 func (x atomix) GetExchangeResult() ExchangeResult {
-	xc, ok := x.Load(exchangeKey{}).(exchange)
+	val, err := x.Load(exchangeKey{})
+	if err != nil {
+		return ExchangeResult{}
+	}
+	xc, ok := val.(exchange)
 	if !ok {
 		return ExchangeResult{}
 	}
@@ -967,13 +1085,25 @@ func (x atomix) GetExchangeResult() ExchangeResult {
 }
 
 func (x atomix) GetRequestsAndResponses() []RequestResponse {
-	xc, ok := x.Load(exchangeKey{}).(exchange)
+	val, err := x.Load(exchangeKey{})
+	if err != nil {
+		return []RequestResponse{}
+	}
+	xc, ok := val.(exchange)
 	if !ok {
 		return []RequestResponse{}
 	}
 	rnr := make([]RequestResponse, 0)
-	for _, cid := range xc.requests.Keys() {
-		req, ok := xc.requests.Load(cid).(requestStruct)
+	keys, err := xc.requests.Keys()
+	if err != nil {
+		return []RequestResponse{}
+	}
+	for _, cid := range keys {
+		val, err := xc.requests.Load(cid)
+		if err != nil {
+			continue
+		}
+		req, ok := val.(requestStruct)
 		if !ok {
 			continue
 		}
@@ -982,12 +1112,14 @@ func (x atomix) GetRequestsAndResponses() []RequestResponse {
 			Request:           req.request,
 			RequestRegistered: req.registered,
 		}
-		resp, gotResponse := xc.responses.Load(cid).(responseStruct)
-		if gotResponse {
-			rr.RespondedTo = true
-			rr.Response = resp.response
-			rr.ResponseRegistered = resp.registered
-			rr.Latency = resp.registered.Sub(req.registered)
+		if val, err := xc.responses.Load(cid); err == nil {
+			resp, gotResponse := val.(responseStruct)
+			if gotResponse {
+				rr.RespondedTo = true
+				rr.Response = resp.response
+				rr.ResponseRegistered = resp.registered
+				rr.Latency = resp.registered.Sub(req.registered)
+			}
 		}
 		rnr = append(rnr, rr)
 	}
@@ -995,11 +1127,19 @@ func (x atomix) GetRequestsAndResponses() []RequestResponse {
 }
 
 func (x atomix) GetRequest(correlID string) (any, error) {
-	xc, ok := x.Load(exchangeKey{}).(exchange)
+	val, err := x.Load(exchangeKey{})
+	if err != nil {
+		return nil, err
+	}
+	xc, ok := val.(exchange)
 	if !ok {
 		return nil, ErrUnableToLoadExchange
 	}
-	r, found := xc.requests.Load(correlID).(requestStruct)
+	val, err = xc.requests.Load(correlID)
+	if err != nil {
+		return nil, err
+	}
+	r, found := val.(requestStruct)
 	if !found {
 		return nil, ErrNoSuchRequest
 	}
@@ -1007,11 +1147,19 @@ func (x atomix) GetRequest(correlID string) (any, error) {
 }
 
 func (x atomix) GetResponse(correlID string) (any, error) {
-	xc, ok := x.Load(exchangeKey{}).(exchange)
+	val, err := x.Load(exchangeKey{})
+	if err != nil {
+		return nil, err
+	}
+	xc, ok := val.(exchange)
 	if !ok {
 		return nil, ErrUnableToLoadExchange
 	}
-	r, found := xc.responses.Load(correlID).(responseStruct)
+	val, err = xc.responses.Load(correlID)
+	if err != nil {
+		return nil, err
+	}
+	r, found := val.(responseStruct)
 	if !found {
 		return nil, ErrNoSuchResponse
 	}
@@ -1019,11 +1167,19 @@ func (x atomix) GetResponse(correlID string) (any, error) {
 }
 
 func (x atomix) GetRequestAge(correlID string) (time.Duration, error) {
-	xc, ok := x.Load(exchangeKey{}).(exchange)
+	val, err := x.Load(exchangeKey{})
+	if err != nil {
+		return -1, err
+	}
+	xc, ok := val.(exchange)
 	if !ok {
 		return -1, ErrUnableToLoadExchange
 	}
-	r, found := xc.requests.Load(correlID).(requestStruct)
+	val, err = xc.requests.Load(correlID)
+	if err != nil {
+		return -1, err
+	}
+	r, found := val.(requestStruct)
 	if !found {
 		return -1, ErrNoSuchRequest
 	}
@@ -1031,7 +1187,14 @@ func (x atomix) GetRequestAge(correlID string) (time.Duration, error) {
 }
 
 func (x atomix) Done() <-chan struct{} {
-	xc, ok := x.Load(exchangeKey{}).(exchange)
+	val, err := x.Load(exchangeKey{})
+	if err != nil {
+		// If we are here, just deliver a closed channel
+		closedChannel := make(chan struct{})
+		close(closedChannel)
+		return closedChannel
+	}
+	xc, ok := val.(exchange)
 	if !ok {
 		// If we are here, just deliver a closed channel
 		closedChannel := make(chan struct{})
@@ -1043,7 +1206,11 @@ func (x atomix) Done() <-chan struct{} {
 
 func (x atomix) Close() {
 	x.Run(func(a anystore.AnyStore) error {
-		xc, ok := a.Load(exchangeKey{}).(exchange)
+		val, err := a.Load(exchangeKey{})
+		if err != nil {
+			return err
+		}
+		xc, ok := val.(exchange)
 		if ok {
 			if !xc.finalized {
 				xc.finalized = true
